@@ -14,11 +14,11 @@ Signed-off-by: Frank Wunderlich <frank-w@public-files.de>
 
 --- a/drivers/net/ethernet/mediatek/mtk_eth_soc.c
 +++ b/drivers/net/ethernet/mediatek/mtk_eth_soc.c
-@@ -3373,6 +3373,7 @@ static const struct mtk_soc_data mt7623_
+@@ -3364,6 +3364,7 @@ static const struct mtk_soc_data mt2701_
  	.hw_features = MTK_HW_FEATURES,
  	.required_clks = MT7623_CLKS_BITMAP,
  	.required_pctl = true,
 +	.offload_version = 2,
  };
  
- static const struct mtk_soc_data mt7629_data = {
+ static const struct mtk_soc_data mt7621_data = {

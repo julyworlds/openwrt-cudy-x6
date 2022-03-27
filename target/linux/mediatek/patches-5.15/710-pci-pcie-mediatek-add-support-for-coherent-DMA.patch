@@ -10,40 +10,26 @@ Signed-off-by: Felix Fietkau <nbd@nbd.name>
 
 --- a/arch/arm64/boot/dts/mediatek/mt7622.dtsi
 +++ b/arch/arm64/boot/dts/mediatek/mt7622.dtsi
-@@ -813,6 +813,8 @@
- 		reg = <0 0x1a143000 0 0x1000>;
- 		reg-names = "port0";
- 		mediatek,pcie-cfg = <&pciecfg>;
-+		mediatek,hifsys = <&hifsys>;
-+		mediatek,cci-control = <&cci_control2>;
- 		#address-cells = <3>;
- 		#size-cells = <2>;
- 		interrupts = <GIC_SPI 228 IRQ_TYPE_LEVEL_LOW>;
-@@ -830,6 +832,7 @@
+@@ -830,6 +830,9 @@
  		bus-range = <0x00 0xff>;
- 		ranges = <0x82000000 0 0x20000000  0x0 0x20000000  0 0x8000000>;
+ 		ranges = <0x82000000 0 0x20000000 0x0 0x20000000 0 0x8000000>;
  		status = "disabled";
 +		dma-coherent;
- 
- 		slot0: pcie@0,0 {
- 			reg = <0x0000 0 0 0 0>;
-@@ -856,6 +859,8 @@
- 		reg = <0 0x1a145000 0 0x1000>;
- 		reg-names = "port1";
- 		mediatek,pcie-cfg = <&pciecfg>;
 +		mediatek,hifsys = <&hifsys>;
 +		mediatek,cci-control = <&cci_control2>;
- 		#address-cells = <3>;
- 		#size-cells = <2>;
- 		interrupts = <GIC_SPI 229 IRQ_TYPE_LEVEL_LOW>;
-@@ -874,6 +879,7 @@
+ 
+ 		#interrupt-cells = <1>;
+ 		interrupt-map-mask = <0 0 0 7>;
+@@ -874,6 +877,9 @@
  		bus-range = <0x00 0xff>;
- 		ranges = <0x82000000 0 0x28000000  0x0 0x28000000  0 0x8000000>;
+ 		ranges = <0x82000000 0 0x28000000 0x0 0x28000000 0 0x8000000>;
  		status = "disabled";
 +		dma-coherent;
++		mediatek,hifsys = <&hifsys>;
++		mediatek,cci-control = <&cci_control2>;
  
- 		slot1: pcie@1,0 {
- 			reg = <0x0800 0 0 0 0>;
+ 		#interrupt-cells = <1>;
+ 		interrupt-map-mask = <0 0 0 7>;
 --- a/drivers/pci/controller/pcie-mediatek.c
 +++ b/drivers/pci/controller/pcie-mediatek.c
 @@ -20,6 +20,7 @@
@@ -66,9 +52,9 @@ Signed-off-by: Felix Fietkau <nbd@nbd.name>
  struct mtk_pcie_port;
  
  /**
-@@ -1042,6 +1048,27 @@ static int mtk_pcie_setup(struct mtk_pci
+@@ -1053,6 +1059,27 @@ static int mtk_pcie_setup(struct mtk_pci
  	struct mtk_pcie_port *port, *tmp;
- 	int err;
+ 	int err, slot;
  
 +	if (of_dma_is_coherent(node)) {
 +		struct regmap *con;
@@ -91,6 +77,6 @@ Signed-off-by: Felix Fietkau <nbd@nbd.name>
 +		regmap_update_bits(con, HIFSYS_DMA_AG_MAP, mask, mask);
 +	}
 +
- 	for_each_available_child_of_node(node, child) {
- 		int slot;
- 
+ 	slot = of_get_pci_domain_nr(dev->of_node);
+ 	if (slot < 0) {
+ 		for_each_available_child_of_node(node, child) {
