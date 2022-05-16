@@ -162,7 +162,7 @@
 
 &state_default {
 	gpio {
-		groups = "wdt", "jtag";
+		groups = "wdt", "uart3", "jtag";
 		function = "gpio";
 	};
 };
