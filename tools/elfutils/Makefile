@@ -17,8 +17,6 @@ PKG_CPE_ID:=cpe:/a:elfutils_project:elfutils
 PKG_FIXUP:=autoreconf
 PKG_INSTALL:=1
 
-HOST_BUILD_DEPENDS:=argp-standalone/host musl-fts/host
-
 include $(INCLUDE_DIR)/host-build.mk
 
 HOST_CONFIGURE_ARGS += \
@@ -28,5 +26,8 @@ HOST_CONFIGURE_ARGS += \
 	--disable-shared \
 	--without-lzma \
 	--without-zstd
+
+HOST_MAKE_FLAGS += \
+	SUBDIRS="lib libelf libcpu backends libebl libdwelf libdwfl libdw"
 
 $(eval $(call HostBuild))
