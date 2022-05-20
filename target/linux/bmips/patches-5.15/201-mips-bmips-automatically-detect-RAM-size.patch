@@ -84,7 +84,7 @@ Signed-off-by: Álvaro Fernández Rojas <noltari@gmail.com>
  struct bmips_quirk {
  	const char		*compatible;
  	void			(*quirk_fn)(void);
-@@ -337,9 +362,90 @@ void __init plat_time_init(void)
+@@ -333,9 +358,90 @@ void __init plat_time_init(void)
  	mips_hpt_frequency = freq;
  }
  
@@ -175,7 +175,7 @@ Signed-off-by: Álvaro Fernández Rojas <noltari@gmail.com>
  	const struct bmips_quirk *q;
  
  	set_io_port_base(0);
-@@ -358,6 +464,18 @@ void __init plat_mem_setup(void)
+@@ -353,6 +459,18 @@ void __init plat_mem_setup(void)
  
  	__dt_setup_arch(dtb);
  

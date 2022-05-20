@@ -19,7 +19,7 @@ Signed-off-by: Álvaro Fernández Rojas <noltari@gmail.com>
 
 --- a/drivers/net/ethernet/broadcom/Kconfig
 +++ b/drivers/net/ethernet/broadcom/Kconfig
-@@ -60,6 +60,14 @@ config BCM63XX_ENET
+@@ -68,6 +68,14 @@ config BCM63XX_ENET
  	  This driver supports the ethernet MACs in the Broadcom 63xx
  	  MIPS chipset family (BCM63XX).
  
@@ -36,9 +36,9 @@ Signed-off-by: Álvaro Fernández Rojas <noltari@gmail.com>
  	depends on HAS_IOMEM
 --- a/drivers/net/ethernet/broadcom/Makefile
 +++ b/drivers/net/ethernet/broadcom/Makefile
-@@ -5,6 +5,7 @@
- 
+@@ -6,6 +6,7 @@
  obj-$(CONFIG_B44) += b44.o
+ obj-$(CONFIG_BCM4908_ENET) += bcm4908_enet.o
  obj-$(CONFIG_BCM63XX_ENET) += bcm63xx_enet.o
 +obj-$(CONFIG_BCM6368_ENETSW) += bcm6368-enetsw.o
  obj-$(CONFIG_BCMGENET) += genet/
