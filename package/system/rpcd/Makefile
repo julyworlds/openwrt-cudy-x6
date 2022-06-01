@@ -52,10 +52,6 @@ define Package/rpcd/conffiles
 endef
 
 TARGET_LDFLAGS += -lcrypt
-# TARGET_CFLAGS += \
-# 	-I$(STAGING_DIR)/usr/include/libnl-tiny
-# -I$(STAGING_DIR)/usr/include \
-# -D_GNU_SOURCE
 
 define Package/rpcd/install
 	$(INSTALL_DIR) $(1)/etc/init.d
@@ -107,4 +103,3 @@ $(eval $(call BuildPlugin,file,,Provides ubus calls for file and directory opera
 $(eval $(call BuildPlugin,rpcsys,,Provides ubus calls for sysupgrade and password changing.))
 $(eval $(call BuildPlugin,iwinfo,+libiwinfo,Provides ubus calls for accessing iwinfo data.))
 $(eval $(call BuildPlugin,ucode,+libucode,Allows implementing plugins using ucode scripts.))
-$(eval $(call BuildPlugin,nl80211,+libnl-tiny,Provides ubus calls for accessing nl80211 data.))
