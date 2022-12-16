@@ -1,22 +1,16 @@
-name: Build Kernel
+name: Build Toolchains
 
 on:
   pull_request:
     paths:
-      - '.github/workflows/check-kernel-patches.yml'
       - '.github/workflows/build.yml'
-      - '.github/workflows/kernel.yml'
-      - 'include/kernel*'
-      - 'package/kernel/**'
-      - 'target/linux/generic/**'
+      - '.github/workflows/toolchain.yml'
+      - 'toolchain/**'
   push:
     paths:
-      - '.github/workflows/check-kernel-patches.yml'
       - '.github/workflows/build.yml'
-      - '.github/workflows/kernel.yml'
-      - 'include/kernel*'
-      - 'package/kernel/**'
-      - 'target/linux/generic/**'
+      - '.github/workflows/toolchain.yml'
+      - 'toolchain/**'
 
 permissions:
   contents: read
@@ -55,7 +49,7 @@ jobs:
            echo "target=$JSON" >> $GITHUB_OUTPUT
 
   build:
-    name: Build Kernel with external toolchain
+    name: Build Target Toolchain
     needs: determine_targets
     permissions:
       contents: read
@@ -67,20 +61,4 @@ jobs:
     uses: ./.github/workflows/build.yml
     with:
       target: ${{ matrix.target }}
-      build_kernel: true
-      build_all_kmods: true
-
-  check-kernel-patches:
-    name: Check Kernel patches
-    needs: determine_targets
-    permissions:
-      contents: read
-      packages: read
-    strategy:
-       fail-fast: False
-       matrix:
-         target: ${{fromJson(needs.determine_targets.outputs.target)}}
-    uses: ./.github/workflows/check-kernel-patches.yml
-    with:
-      target: ${{ matrix.target }}
-
+      build_toolchain: true
