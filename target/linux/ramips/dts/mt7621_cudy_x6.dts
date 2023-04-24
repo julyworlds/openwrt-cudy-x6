@@ -102,7 +102,7 @@
 				read-only;
 			};
 
-			partition@1ff0000 {
+			bdinfo: partition@1ff0000 {
 				label = "bdinfo";
 				reg = <0x1ff0000 0x10000>;
 				read-only;
