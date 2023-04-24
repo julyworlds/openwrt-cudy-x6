@@ -527,6 +527,7 @@ define Device/cudy_x6
   IMAGE_SIZE := 32256k
   UIMAGE_NAME := R13
   DEVICE_PACKAGES := kmod-mt7915-firmware -uboot-envtools
+  SUPPORTED_DEVICES += R13
 endef
 TARGET_DEVICES += cudy_x6
 
