@@ -547,6 +547,7 @@ TARGET_DEVICES += cudy_wr2100
 
 define Device/cudy_x6-v1
   $(Device/dsa-migration)
+  IMAGE_SIZE := 32256k
   DEVICE_VENDOR := Cudy
   DEVICE_MODEL := X6
   DEVICE_VARIANT := v1
