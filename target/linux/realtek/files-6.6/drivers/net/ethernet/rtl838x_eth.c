@@ -187,6 +187,7 @@ struct rtl838x_eth_priv {
 	struct rtl838x_rx_q rx_qs[MAX_RXRINGS];
 	struct phylink *phylink;
 	struct phylink_config phylink_config;
+	struct phylink_pcs pcs;
 	u16 id;
 	u16 family_id;
 	const struct rtl838x_eth_reg *r;
@@ -1441,10 +1442,9 @@ static void rtl838x_mac_config(struct phylink_config *config,
 	pr_info("In %s, mode %x\n", __func__, mode);
 }
 
-static void rtl838x_mac_an_restart(struct phylink_config *config)
+static void rtl838x_pcs_an_restart(struct phylink_pcs *pcs)
 {
-	struct net_device *dev = container_of(config->dev, struct net_device, dev);
-	struct rtl838x_eth_priv *priv = netdev_priv(dev);
+	struct rtl838x_eth_priv *priv = container_of(pcs, struct rtl838x_eth_priv, pcs);
 
 	/* This works only on RTL838x chips */
 	if (priv->family_id != RTL8380_FAMILY_ID)
@@ -1457,12 +1457,11 @@ static void rtl838x_mac_an_restart(struct phylink_config *config)
 	sw_w32(0x6192F, priv->r->mac_force_mode_ctrl + priv->cpu_port * 4);
 }
 
-static void rtl838x_mac_pcs_get_state(struct phylink_config *config,
+static void rtl838x_pcs_get_state(struct phylink_pcs *pcs,
 				  struct phylink_link_state *state)
 {
 	u32 speed;
-	struct net_device *dev = container_of(config->dev, struct net_device, dev);
-	struct rtl838x_eth_priv *priv = netdev_priv(dev);
+	struct rtl838x_eth_priv *priv = container_of(pcs, struct rtl838x_eth_priv, pcs);
 	int port = priv->cpu_port;
 
 	pr_info("In %s\n", __func__);
@@ -1501,6 +1500,14 @@ static void rtl838x_mac_pcs_get_state(struct phylink_config *config,
 		state->pause |= MLO_PAUSE_RX;
 	if (priv->r->get_mac_tx_pause_sts(port))
 		state->pause |= MLO_PAUSE_TX;
+}
+
+static int rtl838x_pcs_config(struct phylink_pcs *pcs, unsigned int neg_mode,
+			      phy_interface_t interface,
+			      const unsigned long *advertising,
+			      bool permit_pause_to_mac)
+{
+	return 0;
 }
 
 static void rtl838x_mac_link_down(struct phylink_config *config,
@@ -1740,7 +1747,7 @@ static int rtmdio_package_rw(struct phy_device *phydev, int op, int port,
 	/* lock and inform bus about non default addressing */
 	phy_lock_mdio_bus(phydev);
 	__mdiobus_write(phydev->mdio.bus, phydev->mdio.addr,
-			RTL821X_PORT_SELECT, shared->addr + port);
+			RTL821X_PORT_SELECT, shared->base_addr + port);
 
 	oldpage = ret = rtmdio_read_page(phydev);
 	if (oldpage >= 0 && oldpage != page) {
@@ -1943,44 +1950,6 @@ static int rtmdio_93xx_write(struct mii_bus *bus, int addr, int regnum, u16 val)
 
 	bus_priv->raw[portaddr] = false;
 	return 0;
-}
-
-/* These wrappers can be dropped after switch to kernel 6.6 */
-
-static int rtmdio_83xx_read_legacy(struct mii_bus *bus, int addr, int regnum)
-{
-	if (regnum & MII_ADDR_C45)
-		return rtmdio_read_c45(bus, addr, mdiobus_c45_devad(regnum),
-				       mdiobus_c45_regad(regnum));
-	else
-		return rtmdio_83xx_read(bus, addr, regnum);
-}
-
-static int rtmdio_93xx_read_legacy(struct mii_bus *bus, int addr, int regnum)
-{
-	if (regnum & MII_ADDR_C45)
-		return rtmdio_read_c45(bus, addr, mdiobus_c45_devad(regnum),
-				       mdiobus_c45_regad(regnum));
-	else
-		return rtmdio_93xx_read(bus, addr, regnum);
-}
-
-static int rtmdio_83xx_write_legacy(struct mii_bus *bus, int addr, int regnum, u16 val)
-{
-	if (regnum & MII_ADDR_C45)
-		return rtmdio_write_c45(bus, addr, mdiobus_c45_devad(regnum),
-					mdiobus_c45_regad(regnum), val);
-	else
-		return rtmdio_83xx_write(bus, addr, regnum, val);
-}
-
-static int rtmdio_93xx_write_legacy(struct mii_bus *bus, int addr, int regnum, u16 val)
-{
-	if (regnum & MII_ADDR_C45)
-		return rtmdio_write_c45(bus, addr, mdiobus_c45_devad(regnum),
-					mdiobus_c45_regad(regnum), val);
-	else
-		return rtmdio_93xx_write(bus, addr, regnum, val);
 }
 
 static int rtmdio_838x_reset(struct mii_bus *bus)
@@ -2244,7 +2213,7 @@ static int rtl838x_mdio_init(struct rtl838x_eth_priv *priv)
 
 	bus_priv = priv->mii_bus->priv;
 	bus_priv->eth_priv = priv;
-	for (i = 0; i < 64; i++) {
+	for (i=0; i < 64; i++) {
 		bus_priv->page[i] = 0;
 		bus_priv->raw[i] = false;
 	}
@@ -2253,8 +2222,8 @@ static int rtl838x_mdio_init(struct rtl838x_eth_priv *priv)
 	switch(priv->family_id) {
 	case RTL8380_FAMILY_ID:
 		priv->mii_bus->name = "rtl838x-eth-mdio";
-		priv->mii_bus->read = rtmdio_83xx_read_legacy;
-		priv->mii_bus->write = rtmdio_83xx_write_legacy;
+		priv->mii_bus->read = rtmdio_83xx_read;
+		priv->mii_bus->write = rtmdio_83xx_write;
 		priv->mii_bus->reset = rtmdio_838x_reset;
 		bus_priv->read_mmd_phy = rtl838x_read_mmd_phy;
 		bus_priv->write_mmd_phy = rtl838x_write_mmd_phy;
@@ -2263,8 +2232,8 @@ static int rtl838x_mdio_init(struct rtl838x_eth_priv *priv)
 		break;
 	case RTL8390_FAMILY_ID:
 		priv->mii_bus->name = "rtl839x-eth-mdio";
-		priv->mii_bus->read = rtmdio_83xx_read_legacy;
-		priv->mii_bus->write = rtmdio_83xx_write_legacy;
+		priv->mii_bus->read = rtmdio_83xx_read;
+		priv->mii_bus->write = rtmdio_83xx_write;
 		priv->mii_bus->reset = rtmdio_839x_reset;
 		bus_priv->read_mmd_phy = rtl839x_read_mmd_phy;
 		bus_priv->write_mmd_phy = rtl839x_write_mmd_phy;
@@ -2273,27 +2242,27 @@ static int rtl838x_mdio_init(struct rtl838x_eth_priv *priv)
 		break;
 	case RTL9300_FAMILY_ID:
 		priv->mii_bus->name = "rtl930x-eth-mdio";
-		priv->mii_bus->read = rtmdio_93xx_read_legacy;
-		priv->mii_bus->write = rtmdio_93xx_write_legacy;
+		priv->mii_bus->read = rtmdio_93xx_read;
+		priv->mii_bus->write = rtmdio_93xx_write;
 		priv->mii_bus->reset = rtmdio_930x_reset;
 		bus_priv->read_mmd_phy = rtl930x_read_mmd_phy;
 		bus_priv->write_mmd_phy = rtl930x_write_mmd_phy;
 		bus_priv->read_phy = rtl930x_read_phy;
 		bus_priv->write_phy = rtl930x_write_phy;
-		priv->mii_bus->probe_capabilities = MDIOBUS_C22_C45;
 		break;
 	case RTL9310_FAMILY_ID:
 		priv->mii_bus->name = "rtl931x-eth-mdio";
-		priv->mii_bus->read = rtmdio_93xx_read_legacy;
-		priv->mii_bus->write = rtmdio_93xx_write_legacy;
-		priv->mii_bus->reset = rtmdio_931x_reset;
+		priv->mii_bus->read = rtmdio_93xx_read;
+		priv->mii_bus->write = rtmdio_93xx_write;
+ 		priv->mii_bus->reset = rtmdio_931x_reset;
 		bus_priv->read_mmd_phy = rtl931x_read_mmd_phy;
 		bus_priv->write_mmd_phy = rtl931x_write_mmd_phy;
 		bus_priv->read_phy = rtl931x_read_phy;
 		bus_priv->write_phy = rtl931x_write_phy;
-		priv->mii_bus->probe_capabilities = MDIOBUS_C22_C45;
 		break;
 	}
+	priv->mii_bus->read_c45 = rtmdio_read_c45;
+	priv->mii_bus->write_c45 = rtmdio_write_c45;
 	priv->mii_bus->parent = &priv->pdev->dev;
 
 	for_each_node_by_name(dn, "ethernet-phy") {
@@ -2400,6 +2369,15 @@ static int rtl93xx_set_features(struct net_device *dev, netdev_features_t featur
 	return 0;
 }
 
+static struct phylink_pcs *rtl838x_mac_select_pcs(struct phylink_config *config,
+						  phy_interface_t interface)
+{
+	struct net_device *dev = to_net_dev(config->dev);
+	struct rtl838x_eth_priv *priv = netdev_priv(dev);
+
+	return &priv->pcs;
+}
+
 static const struct net_device_ops rtl838x_eth_netdev_ops = {
 	.ndo_open = rtl838x_eth_open,
 	.ndo_stop = rtl838x_eth_stop,
@@ -2455,10 +2433,15 @@ static const struct net_device_ops rtl931x_eth_netdev_ops = {
 	.ndo_fix_features = rtl838x_fix_features,
 };
 
+static const struct phylink_pcs_ops rtl838x_pcs_ops = {
+	.pcs_get_state = rtl838x_pcs_get_state,
+	.pcs_an_restart = rtl838x_pcs_an_restart,
+	.pcs_config = rtl838x_pcs_config,
+};
+
 static const struct phylink_mac_ops rtl838x_phylink_ops = {
 	.validate = rtl838x_validate,
-	.mac_pcs_get_state = rtl838x_mac_pcs_get_state,
-	.mac_an_restart = rtl838x_mac_an_restart,
+	.mac_select_pcs = rtl838x_mac_select_pcs,
 	.mac_config = rtl838x_mac_config,
 	.mac_link_down = rtl838x_mac_link_down,
 	.mac_link_up = rtl838x_mac_link_up,
@@ -2643,7 +2626,7 @@ static int __init rtl838x_eth_probe(struct platform_device *pdev)
 	for (int i = 0; i < priv->rxrings; i++) {
 		priv->rx_qs[i].id = i;
 		priv->rx_qs[i].priv = priv;
-		netif_napi_add(dev, &priv->rx_qs[i].napi, rtl838x_poll_rx, 64);
+		netif_napi_add(dev, &priv->rx_qs[i].napi, rtl838x_poll_rx);
 	}
 
 	platform_set_drvdata(pdev, dev);
@@ -2656,8 +2639,10 @@ static int __init rtl838x_eth_probe(struct platform_device *pdev)
 		goto err_free;
 	}
 
+	priv->pcs.ops = &rtl838x_pcs_ops;
 	priv->phylink_config.dev = &dev->dev;
 	priv->phylink_config.type = PHYLINK_NETDEV;
+	__set_bit(PHY_INTERFACE_MODE_INTERNAL, priv->phylink_config.supported_interfaces);
 
 	phylink = phylink_create(&priv->phylink_config, pdev->dev.fwnode,
 				 phy_mode, &rtl838x_phylink_ops);
