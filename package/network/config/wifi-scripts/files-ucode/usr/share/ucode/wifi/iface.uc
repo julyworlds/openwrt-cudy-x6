@@ -6,7 +6,7 @@ import * as fs from 'fs';
 export function parse_encryption(config) {
 	let encryption = split(config.encryption, '+', 2);
 
-	config.wpa_pairwise = (config.hwmode == 'ad') ? 'GCMP' : 'CCMP';
+	config.wpa_pairwise = (config.hw_mode == 'ad') ? 'GCMP' : 'CCMP';
 
 	switch(encryption[1]){
 	case 'tkip+aes':
@@ -101,7 +101,7 @@ export function wpa_key_mgmt(config) {
 		if (config.wpa >= 2 && config.ieee80211r)
 			append_value(config, 'wpa_key_mgmt', 'FT-EAP');
 		if (config.ieee80211w)
-			append_value(config, 'wpa_key_mgmt', 'WPA-EAP--SHA256');
+			append_value(config, 'wpa_key_mgmt', 'WPA-EAP-SHA256');
 		break;
 
 	case 'eap192':
