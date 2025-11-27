@@ -181,8 +181,6 @@
 	status = "okay";
 
 	flash@0 {
-		#address-cells = <1>;
-		#size-cells = <1>;
 		reg = <0>;
 		compatible = "jedec,spi-nor";
 		spi-max-frequency = <50000000>;
@@ -302,9 +300,6 @@
 	nand@0 {
 		compatible = "spi-nand";
 		reg = <0>;
-		#address-cells = <1>;
-		#size-cells = <1>;
-
 		nand-ecc-engine = <&qpic_nand>;
 		nand-bus-width = <8>;
 
