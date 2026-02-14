@@ -3148,6 +3148,13 @@ static int rtpcs_931x_sds_set_ip_mode(struct rtpcs_serdes *sds,
 		mode_val = 0x9;
 		break;
 
+	case RTPCS_SDS_MODE_2500BASEX:
+		/* available SDK code doesn't have this value. based on brute-forcing
+		 * the SerDes mode register field until the link is working
+		 */
+		mode_val = 0x2d;
+		break;
+
 	case RTPCS_SDS_MODE_10GBASER:
 		mode_val = 0x35;
 		break;
@@ -3379,12 +3386,22 @@ static int rtpcs_931x_sds_link_sts_get(struct rtpcs_serdes *sds)
 {
 	u32 sts, sts1, latch_sts, latch_sts1;
 
-	if (0) {
+	switch (sds->hw_mode) {
+	case RTPCS_SDS_MODE_XSGMII:
 		sts = rtpcs_sds_read_bits(sds, 0x41, 29, 8, 0);
 		sts1 = rtpcs_sds_read_bits(sds, 0x81, 29, 8, 0);
 		latch_sts = rtpcs_sds_read_bits(sds, 0x41, 30, 8, 0);
 		latch_sts1 = rtpcs_sds_read_bits(sds, 0x81, 30, 8, 0);
-	} else {
+		break;
+
+	case RTPCS_SDS_MODE_SGMII:
+	case RTPCS_SDS_MODE_HISGMII:
+	case RTPCS_SDS_MODE_2500BASEX:
+		sts = rtpcs_sds_read_bits(sds, 0x41, 29, 8, 0);
+		latch_sts = rtpcs_sds_read_bits(sds, 0x41, 30, 8, 0);
+		break;
+
+	default:
 		sts = rtpcs_sds_read_bits(sds, 0x5, 0, 12, 12);
 		latch_sts = rtpcs_sds_read_bits(sds, 0x4, 1, 2, 2);
 		latch_sts1 = rtpcs_sds_read_bits(sds, 0x42, 1, 2, 2);
