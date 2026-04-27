@@ -87,7 +87,11 @@
 #define RTPCS_93XX_SDS_MODE_OFF			0x1f
 
 #define RTPCS_93XX_SDS_USXGMII_SUBMODE_10GSX	0x00
+#define RTPCS_93XX_SDS_USXGMII_SUBMODE_10GDX	0x01
 #define RTPCS_93XX_SDS_USXGMII_SUBMODE_10GQX	0x02
+#define RTPCS_93XX_SDS_USXGMII_SUBMODE_5GSX	0x03
+#define RTPCS_93XX_SDS_USXGMII_SUBMODE_5GDX	0x04
+#define RTPCS_93XX_SDS_USXGMII_SUBMODE_2_5GSX	0x05
 
 /* Registers of the internal SerDes of the 9310 */
 #define RTPCS_931X_MAC_GROUP0_1_CTRL		(0x13a4)
@@ -97,6 +101,7 @@
 #define RTPCS_931X_MAC_GROUP6_7_CTRL		(0x13b4)
 #define RTPCS_931X_MAC_GROUP8_11_CTRL		(0x13b8)
 #define RTPCS_931X_SERDES_MODE_CTRL		(0x13cc)
+#define RTPCS_931X_SDS_USXGMII_SUBMODE		(0x13e8)
 #define RTPCS_931X_PS_SERDES_OFF_MODE_CTRL_ADDR	(0x13F4)
 #define RTPCS_931X_MAC_SERDES_MODE_CTRL(sds)	(0x136C + (((sds) << 2)))
 #define RTPCS_931X_ISR_SERDES_RXIDLE		(0x12f8)
@@ -1193,7 +1198,11 @@ static const s16 rtpcs_93xx_sds_hw_mode_vals[RTPCS_SDS_MODE_MAX] = {
 	[RTPCS_SDS_MODE_QSGMII]			= RTPCS_93XX_SDS_MODE_QSGMII,
 	[RTPCS_SDS_MODE_XSGMII]			= RTPCS_93XX_SDS_MODE_XSGMII,
 	[RTPCS_SDS_MODE_USXGMII_10GSXGMII]	= RTPCS_93XX_SDS_MODE_USXGMII,
+	[RTPCS_SDS_MODE_USXGMII_10GDXGMII]	= RTPCS_93XX_SDS_MODE_USXGMII,
 	[RTPCS_SDS_MODE_USXGMII_10GQXGMII]	= RTPCS_93XX_SDS_MODE_USXGMII,
+	[RTPCS_SDS_MODE_USXGMII_5GSXGMII]	= RTPCS_93XX_SDS_MODE_USXGMII,
+	[RTPCS_SDS_MODE_USXGMII_5GDXGMII]	= RTPCS_93XX_SDS_MODE_USXGMII,
+	[RTPCS_SDS_MODE_USXGMII_2_5GSXGMII]	= RTPCS_93XX_SDS_MODE_USXGMII,
 };
 
 static int rtpcs_93xx_sds_set_autoneg(struct rtpcs_serdes *sds, unsigned int neg_mode,
@@ -1424,26 +1433,28 @@ pll_setup:
 	return ret;
 }
 
+static const s16 rtpcs_93xx_sds_usxgmii_submodes[RTPCS_SDS_MODE_MAX] = {
+	[0 ... RTPCS_SDS_MODE_MAX - 1]      = -1,
+	[RTPCS_SDS_MODE_USXGMII_10GSXGMII]  = RTPCS_93XX_SDS_USXGMII_SUBMODE_10GSX,
+	[RTPCS_SDS_MODE_USXGMII_10GDXGMII]  = RTPCS_93XX_SDS_USXGMII_SUBMODE_10GDX,
+	[RTPCS_SDS_MODE_USXGMII_10GQXGMII]  = RTPCS_93XX_SDS_USXGMII_SUBMODE_10GQX,
+	[RTPCS_SDS_MODE_USXGMII_5GSXGMII]   = RTPCS_93XX_SDS_USXGMII_SUBMODE_5GSX,
+	[RTPCS_SDS_MODE_USXGMII_5GDXGMII]   = RTPCS_93XX_SDS_USXGMII_SUBMODE_5GDX,
+	[RTPCS_SDS_MODE_USXGMII_2_5GSXGMII] = RTPCS_93XX_SDS_USXGMII_SUBMODE_2_5GSX,
+};
+
 static int rtpcs_93xx_sds_apply_usxgmii_submode(struct rtpcs_serdes *sds,
 						enum rtpcs_sds_mode hw_mode)
 {
-	u8 submode;
+	s16 val = rtpcs_93xx_sds_usxgmii_submodes[hw_mode];
+
+	if (val < 0)
+		return 0;
 
 	if (!sds->swcore_regs.usxgmii_submode)
-		return 0;
+		return -EOPNOTSUPP;
 
-	switch (hw_mode) {
-	case RTPCS_SDS_MODE_USXGMII_10GSXGMII:
-		submode = RTPCS_93XX_SDS_USXGMII_SUBMODE_10GSX;
-		break;
-	case RTPCS_SDS_MODE_USXGMII_10GQXGMII:
-		submode = RTPCS_93XX_SDS_USXGMII_SUBMODE_10GQX;
-		break;
-	default:
-		return 0;
-	}
-
-	return regmap_field_write(sds->swcore_regs.usxgmii_submode, submode);
+	return regmap_field_write(sds->swcore_regs.usxgmii_submode, val);
 }
 
 /*
@@ -3268,10 +3279,16 @@ static int rtpcs_931x_sds_set_ip_mode(struct rtpcs_serdes *sds,
 static int rtpcs_931x_sds_set_mode(struct rtpcs_serdes *sds,
 				   enum rtpcs_sds_mode hw_mode)
 {
+	int ret;
+
 	if (hw_mode == RTPCS_SDS_MODE_XSGMII)
 		return rtpcs_93xx_sds_set_mac_mode(sds, hw_mode);
 
-	return rtpcs_931x_sds_set_ip_mode(sds, hw_mode);
+	ret = rtpcs_931x_sds_set_ip_mode(sds, hw_mode);
+	if (ret)
+		return ret;
+
+	return rtpcs_93xx_sds_apply_usxgmii_submode(sds, hw_mode);
 }
 
 static void rtpcs_931x_sds_reset(struct rtpcs_serdes *sds)
@@ -3815,18 +3832,10 @@ static int rtpcs_931x_setup_serdes(struct rtpcs_serdes *sds,
 	int ret;
 
 	/*
-	 * TODO: USXGMII is currently the swiss army knife to declare 10G
-	 * multi port PHYs. Real devices use other modes instead. Especially
-	 *
-	 * - RTL8224 is driven in 10G_QXGMII
-	 * - RTL8218D/E are driven in (Realtek proprietary) XSGMII (10G SGMII)
-	 *
-	 * For now, disable "USXGMII" modes we cannot configure properly. Only
-	 * USXGMII_10GSXGMII is configured properly for now.
+	 * TODO: XSGMII (Realtek-proprietary 10G SGMII used by RTL8218D/E)
+	 * bring-up is not implemented yet.
 	 */
-	if (hw_mode == RTPCS_SDS_MODE_USXGMII_10GDXGMII ||
-	    hw_mode == RTPCS_SDS_MODE_USXGMII_10GQXGMII ||
-	    hw_mode == RTPCS_SDS_MODE_XSGMII)
+	if (hw_mode == RTPCS_SDS_MODE_XSGMII)
 		return 0;
 
 	val = rtpcs_sds_read_bits(sds, 0x1F, 0x9, 11, 6);
@@ -3943,8 +3952,26 @@ static int rtpcs_931x_sds_probe(struct rtpcs_serdes *sds)
 	if (ret)
 		return ret;
 
-	return rtpcs_sds_alloc_field(sds, &sds->swcore_regs.mac_mode_force,
-				     base, lsb + 7, lsb + 7);
+	ret = rtpcs_sds_alloc_field(sds, &sds->swcore_regs.mac_mode_force,
+				    base, lsb + 7, lsb + 7);
+	if (ret)
+		return ret;
+
+	/*
+	 * USXGMII submode is packed at 5 bits per SerDes for IDs 2..13,
+	 * six entries per 32-bit word, non-straddling.
+	 */
+	if (sds->type == RTPCS_SDS_TYPE_10G) {
+		u8 submode_lsb = ((sds->id - 2) % 6) * 5;
+
+		ret = rtpcs_sds_alloc_field(sds, &sds->swcore_regs.usxgmii_submode,
+					    RTPCS_931X_SDS_USXGMII_SUBMODE + ((sds->id - 2) / 6) * 4,
+					    submode_lsb, submode_lsb + 4);
+		if (ret)
+			return ret;
+	}
+
+	return 0;
 }
 
 static int rtpcs_931x_init(struct rtpcs_ctrl *ctrl)
