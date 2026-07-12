@@ -24,8 +24,9 @@
 #include <linux/kobject.h>
 #include <linux/input.h>
 #include <linux/interrupt.h>
+#include <linux/of.h>
 #include <linux/platform_device.h>
-#include <linux/of_irq.h>
+#include <linux/property.h>
 #include <linux/gpio.h>
 #include <linux/gpio_keys.h>
 #include <linux/gpio/consumer.h>
@@ -219,7 +220,7 @@ static int button_hotplug_create_event(const char *name, unsigned int type,
 	event->seen = seen;
 	event->action = pressed ? "pressed" : "released";
 
-	INIT_WORK(&event->work, (void *)(void *)button_hotplug_work);
+	INIT_WORK(&event->work, button_hotplug_work);
 	schedule_work(&event->work);
 
 	return 0;
@@ -350,8 +351,7 @@ static void gpio_keys_irq_work_func(struct work_struct *work)
 
 static irqreturn_t button_handle_irq(int irq, void *_bdata)
 {
-	struct gpio_keys_button_data *bdata =
-		(struct gpio_keys_button_data *) _bdata;
+	struct gpio_keys_button_data *bdata = _bdata;
 
 	mod_delayed_work(system_wq, &bdata->work,
 			 msecs_to_jiffies(bdata->software_debounce));
