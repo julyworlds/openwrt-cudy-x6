@@ -1277,7 +1277,7 @@ void rtl839x_pie_rule_dump(struct  pie_rule *pr)
 static int rtl839x_pie_rule_read(struct rtl838x_switch_priv *priv, int idx, struct  pie_rule *pr)
 {
 	/* Read IACL table (2) via register 0 */
-	struct table_reg *q = rtl_table_get(RTL8380_TBL_0, 2);
+	struct table_reg *q = rtl_table_get(RTL8390_TBL_0, 2);
 	u32 r[17];
 	int block = idx / PIE_BLOCK_SIZE;
 	u32 t_select = sw_r32(RTL839X_ACL_BLK_TMPLTE_CTRL(block));
@@ -1377,10 +1377,10 @@ static int rtl839x_pie_verify_template(struct rtl838x_switch_priv *priv,
 			return -1;
 	}
 
-	if (ether_addr_to_u64(pr->smac) && !rtl839x_pie_templ_has(t, TEMPLATE_FIELD_SMAC0))
+	if (ether_addr_to_u64(pr->smac_m) && !rtl839x_pie_templ_has(t, TEMPLATE_FIELD_SMAC0))
 		return -1;
 
-	if (ether_addr_to_u64(pr->dmac) && !rtl839x_pie_templ_has(t, TEMPLATE_FIELD_DMAC0))
+	if (ether_addr_to_u64(pr->dmac_m) && !rtl839x_pie_templ_has(t, TEMPLATE_FIELD_DMAC0))
 		return -1;
 
 	if (pr->itag_m && !rtl839x_pie_templ_has(t, TEMPLATE_FIELD_ITAG))
