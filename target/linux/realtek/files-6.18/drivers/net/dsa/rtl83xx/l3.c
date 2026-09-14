@@ -297,10 +297,22 @@ static int otto_l3_930x_find_slot(struct otto_l3_ctrl *ctrl, struct otto_l3_rout
 			otto_l3_930x_host_route_read(ctrl, idx, &route_entry);
 			dev_dbg(ctrl->dev, "route valid %d, route dest: %pI4, hit %d\n",
 				rt->attr.valid, &rt->dst_ip, rt->attr.hit);
-			if (!must_exist && rt->attr.valid)
+			if (!must_exist && !route_entry.attr.valid)
 				return idx;
-			if (must_exist && route_entry.dst_ip == rt->dst_ip)
-				return idx;
+			if (must_exist &&
+			    route_entry.attr.valid &&
+			    route_entry.attr.type == rt->attr.type) {
+				switch (rt->attr.type) {
+				case 0:
+					if (route_entry.dst_ip == rt->dst_ip)
+						return idx;
+					break;
+				case 2:
+					if (ipv6_addr_equal(&route_entry.dst_ip6, &rt->dst_ip6))
+						return idx;
+					break;
+				}
+			}
 		}
 	}
 
@@ -881,7 +893,16 @@ static int otto_l3_nexthop_update(struct otto_l3_ctrl *ctrl, __be32 ip_addr, u64
 		r->pr.dip_m = inet_make_mask(r->prefix_len);
 
 		if (r->is_host_route) {
-			int slot = ctrl->cfg->find_slot(ctrl, r, false);
+			int slot = ctrl->cfg->find_slot(ctrl, r, true);
+
+			if (slot < 0)
+				slot = ctrl->cfg->find_slot(ctrl, r, false);
+
+			if (slot < 0) {
+				dev_err(ctrl->dev, "no slot for host route %pI4\n",
+					&r->dst_ip);
+				continue;
+			}
 
 			dev_info(ctrl->dev, "Got slot for route: %d\n", slot);
 			ctrl->cfg->host_route_write(ctrl, slot, r);
@@ -956,18 +977,27 @@ static void otto_l3_route_remove(struct otto_l3_ctrl *ctrl, struct otto_l3_route
 		dev_warn(ctrl->dev, "Could not remove route\n");
 
 	if (r->is_host_route) {
-		id = ctrl->cfg->find_slot(ctrl, r, false);
-		dev_dbg(ctrl->dev, "Got id for host route: %d\n", id);
-		r->attr.valid = false;
-		ctrl->cfg->host_route_write(ctrl, id, r);
+		id = ctrl->cfg->find_slot(ctrl, r, true);
+		if (id >= 0) {
+			dev_dbg(ctrl->dev, "Got id for host route: %d\n", id);
+			r->attr.valid = false;
+			ctrl->cfg->host_route_write(ctrl, id, r);
+		} else {
+			dev_err(ctrl->dev, "Host route %pI4 was not in hardware\n",
+				&r->dst_ip);
+		}
 		clear_bit(r->id - MAX_ROUTES, ctrl->host_route_use_bm);
 	} else {
 		/* If there is a HW representation of the route, delete it */
 		if (ctrl->cfg->route_lookup_hw) {
 			id = ctrl->cfg->route_lookup_hw(ctrl, r);
-			dev_info(ctrl->dev, "Got id for prefix route: %d\n", id);
-			r->attr.valid = false;
-			ctrl->cfg->route_write(ctrl, id, r);
+			if (id >= 0) {
+				dev_dbg(ctrl->dev, "Got id for prefix route: %d\n", id);
+				r->attr.valid = false;
+				ctrl->cfg->route_write(ctrl, id, r);
+			} else {
+				dev_err(ctrl->dev, "Prefix route was not in hardware\n");
+			}
 		}
 		clear_bit(r->id, ctrl->route_use_bm);
 	}
@@ -1141,6 +1171,12 @@ static int otto_l3_fib_add_v4(struct otto_l3_ctrl *ctrl, struct fib_entry_notifi
 			route->attr.type = 0;
 
 			slot = ctrl->cfg->find_slot(ctrl, route, false);
+			if (slot < 0) {
+				dev_err(ctrl->dev, "no slot for host route %pI4\n",
+					&route->dst_ip);
+				goto out_free_rt;
+			}
+
 			dev_dbg(ctrl->dev, "Got slot for route: %d\n", slot);
 			ctrl->cfg->host_route_write(ctrl, slot, route);
 		}
