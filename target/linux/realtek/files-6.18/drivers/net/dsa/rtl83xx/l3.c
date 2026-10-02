@@ -10,6 +10,7 @@
 #include <net/arp.h>
 #include <net/fib_notifier.h>
 #include <net/ip6_fib.h>
+#include <net/ndisc.h>
 #include <net/netevent.h>
 #include <net/nexthop.h>
 #include <uapi/linux/rtnetlink.h>
@@ -30,6 +31,7 @@ struct otto_l3_net_event_work {
 	struct in6_addr gw_addr;
 	int ifindex;
 	bool valid;
+	u8 type;
 };
 
 struct otto_l3_fib_event_work {
@@ -932,6 +934,31 @@ static int otto_l3_alloc_egress_intf(struct otto_l3_ctrl *ctrl, u64 mac, int vla
 /* Row 0 is not used, see otto_l3_930x_setup(). */
 #define FIRST_PREFIX_ROW	1
 
+/* An IPv6 prefix route is matched over three consecutive rows, and only rows
+ * 0 and 3 of every eight can hold the first of the three, so two rows in every
+ * eight start no route at all. The last row one may start at is four below the
+ * last row of the table. The IPv6 rows therefore run downwards from there
+ * against the IPv4 rows, which run upwards from FIRST_PREFIX_ROW (Realtek GPL
+ * SDK, dal_longan_l3.c: L3_ROUTE_TBL_USED, IS_L3_ROUTE_IPV6_IDX_VALID and
+ * L3_ROUTE_IPV6_IDX_MAX).
+ */
+#define V6_PREFIX_ROWS		3
+/* One access at an entry's first row reads or writes the whole entry, so a
+ * move copies that row alone
+ */
+#define V6_MOVE_ROWS		1
+#define FIRST_V6_ROW		(MAX_ROUTES - 1 - 4)
+
+static int otto_l3_v6_row(int slot)
+{
+	return FIRST_V6_ROW - (slot / 2) * 8 - (slot % 2) * V6_PREFIX_ROWS;
+}
+
+static int otto_l3_v6_slot(int row)
+{
+	return 2 * (FIRST_V6_ROW / 8 - row / 8) + (row % 8 ? 0 : 1);
+}
+
 /* The programmed prefix routes of one address family sit in one dense block,
  * longest prefix first, because the hardware answers a lookup with the lowest
  * matching row rather than the most specific one. A lookup carries the entry
@@ -976,8 +1003,8 @@ static void otto_l3_rows_stale(struct otto_l3_ctrl *ctrl, struct otto_l3_route *
 /* Open the row this route belongs at, pushing everything below it down. */
 static int otto_l3_route_place(struct otto_l3_ctrl *ctrl, struct otto_l3_route *r)
 {
+	int below, rows, row, last, v6_rows, err;
 	struct otto_l3_route *q;
-	int row, last, err;
 
 	if (!ctrl->cfg->route_rows_move)
 		return r->id;
@@ -985,8 +1012,52 @@ static int otto_l3_route_place(struct otto_l3_ctrl *ctrl, struct otto_l3_route *
 	if (ctrl->prefix_rows_stale)
 		return -1;
 
-	row = FIRST_PREFIX_ROW + otto_l3_prefix_rows(ctrl, r->attr.type, r->prefix_len);
-	last = FIRST_PREFIX_ROW + otto_l3_prefix_rows(ctrl, r->attr.type, 0);
+	below = otto_l3_prefix_rows(ctrl, r->attr.type, r->prefix_len);
+	rows = otto_l3_prefix_rows(ctrl, r->attr.type, 0);
+
+	if (r->attr.type == ROUTE_TYPE_IP6UC) {
+		int v4_rows = otto_l3_prefix_rows(ctrl, ROUTE_TYPE_IP4UC, 0);
+
+		if (otto_l3_v6_row(rows) < FIRST_PREFIX_ROW + v4_rows) {
+			dev_err(ctrl->dev, "prefix route table full, %d IPv4 and %d IPv6 routes\n",
+				v4_rows, rows);
+			return -1;
+		}
+
+		/* Deepest first, so a route is only written over a slot the
+		 * route that held it has already left. Once one slot has
+		 * moved, a failure leaves the block half shifted whatever the
+		 * failing move wrote itself.
+		 */
+		for (int s = rows - 1; s >= rows - below; s--) {
+			err = ctrl->cfg->route_rows_move(ctrl, otto_l3_v6_row(s + 1),
+							 otto_l3_v6_row(s), V6_MOVE_ROWS);
+			if (err) {
+				if (err == -EIO || s < rows - 1)
+					otto_l3_rows_stale(ctrl, r, otto_l3_v6_row(s));
+				return -1;
+			}
+		}
+
+		row = otto_l3_v6_row(rows - below);
+
+		list_for_each_entry(q, &ctrl->routes_list, list)
+			if (!q->is_host_route && q->attr.type == r->attr.type &&
+			    q->row >= FIRST_PREFIX_ROW && q->row <= row)
+				q->row = otto_l3_v6_row(otto_l3_v6_slot(q->row) + 1);
+
+		return row;
+	}
+
+	v6_rows = otto_l3_prefix_rows(ctrl, ROUTE_TYPE_IP6UC, 0);
+	row = FIRST_PREFIX_ROW + below;
+	last = FIRST_PREFIX_ROW + rows;
+
+	if (v6_rows && otto_l3_v6_row(v6_rows - 1) <= last) {
+		dev_err(ctrl->dev, "prefix route table full, %d IPv4 and %d IPv6 routes\n",
+			rows, v6_rows);
+		return -1;
+	}
 
 	if (row < last) {
 		/* A move that fails partway leaves the block half shifted, and
@@ -1013,30 +1084,52 @@ static int otto_l3_route_place(struct otto_l3_ctrl *ctrl, struct otto_l3_route *
 static void otto_l3_route_compact(struct otto_l3_ctrl *ctrl, struct otto_l3_route *r)
 {
 	struct otto_l3_route *q;
-	int last;
+	int rows, last;
 
 	if (!ctrl->cfg->route_rows_move || r->row < FIRST_PREFIX_ROW ||
 	    ctrl->prefix_rows_stale)
 		return;
 
-	last = FIRST_PREFIX_ROW + otto_l3_prefix_rows(ctrl, r->attr.type, 0) - 1;
-	if (r->row >= last)
-		return;
+	rows = otto_l3_prefix_rows(ctrl, r->attr.type, 0);
 
 	/* The leaving row is already invalid, so even a move that wrote nothing
 	 * leaves a hole in the block that the row count cannot see.
 	 */
-	if (ctrl->cfg->route_rows_move(ctrl, r->row, r->row + 1, last - r->row)) {
-		otto_l3_rows_stale(ctrl, r, r->row);
-		return;
+	if (r->attr.type == ROUTE_TYPE_IP6UC) {
+		int slot = otto_l3_v6_slot(r->row);
+
+		last = otto_l3_v6_row(rows - 1);
+		if (slot >= rows - 1)
+			return;
+
+		for (int s = slot + 1; s < rows; s++)
+			if (ctrl->cfg->route_rows_move(ctrl, otto_l3_v6_row(s - 1),
+						       otto_l3_v6_row(s), V6_MOVE_ROWS)) {
+				otto_l3_rows_stale(ctrl, r, otto_l3_v6_row(s));
+				return;
+			}
+
+		list_for_each_entry(q, &ctrl->routes_list, list)
+			if (!q->is_host_route && q->attr.type == r->attr.type &&
+			    q->row >= FIRST_PREFIX_ROW && q->row < r->row)
+				q->row = otto_l3_v6_row(otto_l3_v6_slot(q->row) - 1);
+	} else {
+		last = FIRST_PREFIX_ROW + rows - 1;
+		if (r->row >= last)
+			return;
+
+		if (ctrl->cfg->route_rows_move(ctrl, r->row, r->row + 1, last - r->row)) {
+			otto_l3_rows_stale(ctrl, r, r->row);
+			return;
+		}
+
+		list_for_each_entry(q, &ctrl->routes_list, list)
+			if (!q->is_host_route && q->attr.type == r->attr.type &&
+			    q->row > r->row)
+				q->row--;
 	}
 
-	list_for_each_entry(q, &ctrl->routes_list, list)
-		if (!q->is_host_route && q->attr.type == r->attr.type &&
-		    q->row > r->row)
-			q->row--;
-
-	/* The tail now holds a copy of the row above it. */
+	/* The tail now holds a copy of the row the block has pulled up. */
 	r->attr.valid = false;
 	ctrl->cfg->route_write(ctrl, last, r);
 }
@@ -1219,30 +1312,31 @@ static int otto_l3_nexthop_update(struct otto_l3_ctrl *ctrl, u8 type, int ifinde
 	return 0;
 }
 
-static int otto_l3_port_ipv4_resolve(struct otto_l3_ctrl *ctrl,
-				     struct net_device *dev, __be32 ip_addr)
+static int otto_l3_port_gw_resolve(struct otto_l3_ctrl *ctrl, struct net_device *dev,
+				   struct neigh_table *tbl, const struct in6_addr *gw)
 {
-	struct neighbour *n = neigh_lookup(&arp_tbl, &ip_addr, dev);
+	/* An ARP neighbour is keyed on four bytes, which in a v4-mapped
+	 * address are the last word of it.
+	 */
+	const void *key = tbl == &arp_tbl ? (const void *)&gw->s6_addr32[3] : gw;
+	u8 type = tbl == &arp_tbl ? ROUTE_TYPE_IP4UC : ROUTE_TYPE_IP6UC;
+	struct neighbour *n = neigh_lookup(tbl, key, dev);
 	int err = 0;
 	u64 mac;
 
 	if (!n) {
-		n = neigh_create(&arp_tbl, &ip_addr, dev);
+		n = neigh_create(tbl, key, dev);
 		if (IS_ERR(n))
 			return PTR_ERR(n);
 	}
 
 	/* If the neigh is already resolved, then go ahead and
-	 * install the entry, otherwise start the ARP process to
-	 * resolve the neigh.
+	 * install the entry, otherwise start the resolution.
 	 */
 	if (n->nud_state & NUD_VALID) {
-		struct in6_addr gw;
-
 		mac = ether_addr_to_u64(n->ha);
 		dev_info(ctrl->dev, "resolved mac: %016llx\n", mac);
-		ipv6_addr_set_v4mapped(ip_addr, &gw);
-		otto_l3_nexthop_update(ctrl, ROUTE_TYPE_IP4UC, dev->ifindex, &gw, mac, true);
+		otto_l3_nexthop_update(ctrl, type, dev->ifindex, gw, mac, true);
 	} else {
 		dev_info(ctrl->dev, "need to wait\n");
 		neigh_event_send(n, NULL);
@@ -1669,7 +1763,7 @@ static int otto_l3_fib_add_v4(struct otto_l3_ctrl *ctrl, struct fib_entry_notifi
 
 	/* We need to resolve the mac address of the GW */
 	if (nh->fib_nh_gw4)
-		otto_l3_port_ipv4_resolve(ctrl, ndev, nh->fib_nh_gw4);
+		otto_l3_port_gw_resolve(ctrl, ndev, &arp_tbl, &gw);
 
 	nh->fib_nh_flags |= RTNH_F_OFFLOAD;
 
@@ -1862,10 +1956,18 @@ static void otto_l3_net_event_work_do(struct work_struct *work)
 	struct otto_l3_net_event_work *net_work =
 		container_of(work, struct otto_l3_net_event_work, work);
 
-	otto_l3_nexthop_update(net_work->ctrl, ROUTE_TYPE_IP4UC, net_work->ifindex,
+	otto_l3_nexthop_update(net_work->ctrl, net_work->type, net_work->ifindex,
 			       &net_work->gw_addr, net_work->mac, net_work->valid);
 
 	kfree(net_work);
+}
+
+/* nd_tbl exists only where IPv6 is built in, or is a module this driver
+ * can reach
+ */
+static bool otto_l3_is_nd_tbl(const struct neigh_table *tbl)
+{
+	return IS_REACHABLE(CONFIG_IPV6) && tbl == &nd_tbl;
 }
 
 static int otto_l3_netevent_notifier(struct notifier_block *this, unsigned long event, void *ptr)
@@ -1883,7 +1985,14 @@ static int otto_l3_netevent_notifier(struct notifier_block *this, unsigned long 
 		if (!ctrl->cfg->setup)
 			return NOTIFY_DONE;
 
-		if (n->tbl != &arp_tbl)
+		if (n->tbl != &arp_tbl && !otto_l3_is_nd_tbl(n->tbl))
+			return NOTIFY_DONE;
+
+		/* Only where the L3 tables carry an IPv6 destination can a
+		 * route be waiting on an ndisc neighbour, which is how the
+		 * FIB side of the same question is answered.
+		 */
+		if (otto_l3_is_nd_tbl(n->tbl) && !ctrl->cfg->use_l3_tables)
 			return NOTIFY_DONE;
 		dev = n->dev;
 		port = otto_l3_port_dev_lower_find(dev, ctrl);
@@ -1907,7 +2016,14 @@ static int otto_l3_netevent_notifier(struct notifier_block *this, unsigned long 
 		net_work->mac = ether_addr_to_u64(n->ha);
 		read_unlock_bh(&n->lock);
 		net_work->ifindex = dev->ifindex;
-		ipv6_addr_set_v4mapped(*(__be32 *)n->primary_key, &net_work->gw_addr);
+		if (n->tbl == &arp_tbl) {
+			ipv6_addr_set_v4mapped(*(__be32 *)n->primary_key,
+					       &net_work->gw_addr);
+			net_work->type = ROUTE_TYPE_IP4UC;
+		} else {
+			net_work->gw_addr = *(struct in6_addr *)n->primary_key;
+			net_work->type = ROUTE_TYPE_IP6UC;
+		}
 
 		dev_dbg(ctrl->dev, "updating neighbour on port %d, mac %016llx\n",
 			port, net_work->mac);
@@ -1945,6 +2061,16 @@ static const char * const otto_l3_930x_dump_action_name[4] = {
 	[ROUTE_ACT_COPY2CPU] = "copy",
 	[ROUTE_ACT_DROP]     = "drop",
 };
+
+/* Rows one entry of the prefix route table covers, by type: IPv4 unicast,
+ * IPv4 multicast, IPv6 unicast, IPv6 multicast. The rows behind the first
+ * read back as entries of their own, so anything walking the table has to
+ * step over them. The multicast pair is the Realtek GPL SDK's
+ * (dal_longan_l3.h: LONGAN_L3_ROUTE_IPMC_WIDTH_IPV4 and _IPV6); nothing here
+ * programs a multicast entry, and the walk has to step over one it meets all
+ * the same.
+ */
+static const u8 otto_l3_930x_prefix_widths[] = { 1, 2, V6_PREFIX_ROWS, 8 };
 
 /* One valid entry, decoded and ready to print. Multicast entries (type 1 and
  * 3) only carry what word 0 says (valid, type, hence width): no field
@@ -2033,7 +2159,7 @@ static bool otto_l3_930x_dump_decode_prefix(const u32 *data, u32 addr,
 	rec->addr = addr;
 	rec->idx = addr;
 	rec->type = (data[0] >> 29) & 0x3;
-	rec->width = 1;
+	rec->width = otto_l3_930x_prefix_widths[rec->type];
 
 	if (rec->type != 0 && rec->type != 2)
 		return true; /* multicast: type/width only */
@@ -2168,18 +2294,21 @@ static int otto_l3_930x_dump_show(struct seq_file *m, void *v)
 	if (handle < 0)
 		return handle;
 
-	for (addr = 0; addr < rows; addr++) {
-		if (!(addr % 64))
+	for (addr = 0, n = 0; addr < rows; n++) {
+		if (!(n % 64))
 			cond_resched();
 
 		__otto_table_read(handle, addr, &prefix_data);
-		if (!otto_l3_930x_dump_decode_prefix(prefix_data, addr, &rec))
+		if (!otto_l3_930x_dump_decode_prefix(prefix_data, addr, &rec)) {
+			addr++;
 			continue;
+		}
 
 		if (!rec.decoded)
 			mc_seen++;
 
 		otto_l3_930x_dump_print(m, &rec);
+		addr += rec.width;
 	}
 
 	otto_table_release(handle);
@@ -2360,10 +2489,12 @@ static int otto_l3_930x_clear_hit_prefix(unsigned int *cleared, unsigned int *sk
 	if (handle < 0)
 		return handle;
 
-	for (addr = 0; addr < rows; addr++) {
+	for (addr = 0; addr < rows;) {
 		__otto_table_read(handle, addr, &data);
-		if (!otto_l3_930x_dump_decode_prefix(data, addr, &rec))
+		if (!otto_l3_930x_dump_decode_prefix(data, addr, &rec)) {
+			addr++;
 			continue;
+		}
 
 		if (!rec.decoded) {
 			(*skipped_mc)++;
@@ -2372,6 +2503,8 @@ static int otto_l3_930x_clear_hit_prefix(unsigned int *cleared, unsigned int *sk
 			__otto_table_write(handle, addr, &data);
 			(*cleared)++;
 		}
+
+		addr += rec.width;
 	}
 
 	otto_table_release(handle);
