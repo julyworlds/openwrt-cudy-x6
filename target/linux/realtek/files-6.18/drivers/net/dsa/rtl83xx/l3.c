@@ -35,6 +35,10 @@
 #define ROUTE_ACT_COPY2CPU	2
 #define ROUTE_ACT_DROP		3
 
+/* Route kinds */
+#define ROUTE_PREFIX		0
+#define ROUTE_HOST		1
+
 /* L3 Routing */
 #define RTL839X_ROUTING_SA_CTRL			0x6afc
 #define RTL930X_L3_HOST_TBL_CTRL		(0xAB48)
@@ -1365,6 +1369,11 @@ static void otto_l3_route_trap_hw(struct otto_l3_ctrl *ctrl, struct otto_l3_rout
 	if (!ctrl->cfg->use_l3_tables || r->attr.action == ROUTE_ACT_TRAP2CPU)
 		return;
 
+	/* What the route says is what the next write of it puts in hardware */
+	r->attr.action = ROUTE_ACT_TRAP2CPU;
+	r->attr.ttl_dec = false;
+	r->attr.ttl_check = false;
+
 	if (r->is_host_route)
 		slot = ctrl->cfg->find_slot(ctrl, r, true);
 
@@ -1378,10 +1387,6 @@ static void otto_l3_route_trap_hw(struct otto_l3_ctrl *ctrl, struct otto_l3_rout
 	else
 		dev_info(ctrl->dev, "no valid neighbour for %pI6c, routing %s in software\n",
 			 &r->gw_ip, otto_l3_route_dst(r, dst, sizeof(dst)));
-
-	r->attr.action = ROUTE_ACT_TRAP2CPU;
-	r->attr.ttl_dec = false;
-	r->attr.ttl_check = false;
 
 	if (otto_l3_host_shadowed(ctrl, r))
 		return;
@@ -1611,7 +1616,7 @@ static void otto_l3_route_remove(struct otto_l3_ctrl *ctrl, struct otto_l3_route
 				&r->dst_ip);
 		}
 
-		if (r->tb_id == RT_TABLE_LOCAL)
+		if (r->tb_id == RT_TABLE_LOCAL && !r->replaced)
 			otto_l3_host_unshadow(ctrl, r);
 	} else {
 		/* If there is a HW representation of the route, delete it */
@@ -1671,18 +1676,21 @@ static void otto_l3_route_teardown(struct otto_l3_ctrl *ctrl, struct otto_l3_rou
 	otto_l3_route_remove(ctrl, r);
 }
 
-static struct otto_l3_route *otto_l3_host_route_alloc(struct otto_l3_ctrl *ctrl,
-						      const struct in6_addr *gw)
+static struct otto_l3_route *otto_l3_route_alloc(struct otto_l3_ctrl *ctrl,
+						 const struct in6_addr *gw, int kind)
 {
+	bool host = kind == ROUTE_HOST;
+	unsigned long *use_bm = host ? ctrl->host_route_use_bm : ctrl->route_use_bm;
+	int size = host ? MAX_HOST_ROUTES : MAX_ROUTES;
 	struct otto_l3_route *r;
-	int idx = 0, err;
+	int idx, err;
 
 	mutex_lock(ctrl->lock);
 
-	idx = find_first_zero_bit(ctrl->host_route_use_bm, MAX_HOST_ROUTES);
-	if (idx >= MAX_HOST_ROUTES) {
-		dev_err(ctrl->dev, "host route table full, %d entries in use\n",
-			MAX_HOST_ROUTES);
+	idx = find_first_zero_bit(use_bm, size);
+	if (idx >= size) {
+		dev_err(ctrl->dev, "%s route table full, %d entries in use\n",
+			host ? "host" : "prefix", size);
 		mutex_unlock(ctrl->lock);
 		return NULL;
 	}
@@ -1691,90 +1699,34 @@ static struct otto_l3_route *otto_l3_host_route_alloc(struct otto_l3_ctrl *ctrl,
 	r = kzalloc(sizeof(*r), GFP_KERNEL);
 	if (!r) {
 		mutex_unlock(ctrl->lock);
-		return r;
+		return NULL;
 	}
 
 	/* We require a unique route ID irrespective of whether it is a prefix or host
 	 * route (on RTL93xx) as we use this ID to associate a DMAC and next-hop entry
 	 */
-	r->id = idx + MAX_ROUTES;
-	r->row = -1;			/* placed by find_slot(), not by row */
-
+	r->id = host ? idx + MAX_ROUTES : idx;
+	r->row = -1;	/* no row until placed; a host route never has one */
 	r->gw_ip = *gw;
 	r->pr.id = -1; /* We still need to allocate a rule in HW */
 	r->pr.packet_cntr = -1;
-	r->is_host_route = true;
+	r->is_host_route = host;
 	INIT_LIST_HEAD(&r->srcs);
 
 	err = rhltable_insert(&ctrl->routes, &r->linkage, otto_l3_route_ht_params);
 	if (err) {
 		dev_err(ctrl->dev, "Could not insert new rule\n");
 		mutex_unlock(ctrl->lock);
-		goto out_free;
-	}
-
-	list_add_tail(&r->list, &ctrl->routes_list);
-	set_bit(idx, ctrl->host_route_use_bm);
-
-	mutex_unlock(ctrl->lock);
-
-	return r;
-
-out_free:
-	kfree(r);
-
-	return NULL;
-}
-
-static struct otto_l3_route *otto_l3_route_alloc(struct otto_l3_ctrl *ctrl,
-						 const struct in6_addr *gw)
-{
-	struct otto_l3_route *r;
-	int idx = 0, err;
-
-	mutex_lock(ctrl->lock);
-
-	idx = find_first_zero_bit(ctrl->route_use_bm, MAX_ROUTES);
-	if (idx >= MAX_ROUTES) {
-		dev_err(ctrl->dev, "prefix route table full, %d entries in use\n",
-			MAX_ROUTES);
-		mutex_unlock(ctrl->lock);
+		kfree(r);
 		return NULL;
 	}
-	dev_dbg(ctrl->dev, "id: %d, gw %pI6c\n", idx, gw);
-
-	r = kzalloc(sizeof(*r), GFP_KERNEL);
-	if (!r) {
-		mutex_unlock(ctrl->lock);
-		return r;
-	}
-
-	r->id = idx;
-	r->row = -1;			/* no row until it is placed */
-	r->gw_ip = *gw;
-	r->pr.id = -1; /* We still need to allocate a rule in HW */
-	r->pr.packet_cntr = -1;
-	r->is_host_route = false;
-	INIT_LIST_HEAD(&r->srcs);
-
-	err = rhltable_insert(&ctrl->routes, &r->linkage, otto_l3_route_ht_params);
-	if (err) {
-		dev_err(ctrl->dev, "Could not insert new rule\n");
-		mutex_unlock(ctrl->lock);
-		goto out_free;
-	}
 
 	list_add_tail(&r->list, &ctrl->routes_list);
-	set_bit(idx, ctrl->route_use_bm);
+	set_bit(idx, use_bm);
 
 	mutex_unlock(ctrl->lock);
 
 	return r;
-
-out_free:
-	kfree(r);
-
-	return NULL;
 }
 
 static int otto_l3_fib_check_v4(struct otto_l3_ctrl *ctrl,
@@ -1809,7 +1761,7 @@ static void otto_l3_host_route_trap(struct otto_l3_ctrl *ctrl,
 	int slot;
 
 	ipv6_addr_set_v4mapped(0, &gw);
-	route = otto_l3_host_route_alloc(ctrl, &gw);
+	route = otto_l3_route_alloc(ctrl, &gw, ROUTE_HOST);
 	if (!route)
 		return;
 
@@ -1856,7 +1808,7 @@ static void otto_l3_fib_trap_v4(struct otto_l3_ctrl *ctrl, struct fib_entry_noti
 	}
 
 	ipv6_addr_set_v4mapped(0, &gw);
-	route = otto_l3_route_alloc(ctrl, &gw);
+	route = otto_l3_route_alloc(ctrl, &gw, ROUTE_PREFIX);
 	if (!route) {
 		dev_err(ctrl->dev, "no row to trap %pI4/%d\n", &info->dst, info->dst_len);
 		return;
@@ -1934,8 +1886,10 @@ static int otto_l3_fib_add_v4(struct otto_l3_ctrl *ctrl, struct fib_entry_notifi
 		dev_dbg(ctrl->dev, "route not offloaded: no device, nexthop object or tunnel\n");
 		route = otto_l3_route_find(ctrl, info->tb_id, ROUTE_TYPE_IP4UC, info->dst,
 					   NULL, info->dst_len);
-		if (route)
+		if (route) {
+			route->replaced = true;
 			otto_l3_route_teardown(ctrl, route);
+		}
 		otto_l3_fib_trap_v4(ctrl, info);
 		return 0;
 	}
@@ -1957,6 +1911,10 @@ static int otto_l3_fib_add_v4(struct otto_l3_ctrl *ctrl, struct fib_entry_notifi
 	if (route) {
 		dev_dbg(ctrl->dev, "replacing route %pI4/%d, id %d\n",
 			&info->dst, info->dst_len, route->id);
+		/* A route to the same destination takes the entry over: a
+		 * main /32 kept out of it stays out while it changes hands
+		 */
+		route->replaced = true;
 		otto_l3_route_teardown(ctrl, route);
 	}
 
@@ -1972,10 +1930,9 @@ static int otto_l3_fib_add_v4(struct otto_l3_ctrl *ctrl, struct fib_entry_notifi
 
 	/* Allocate route or host-route entry (if hardware supports this) */
 	ipv6_addr_set_v4mapped(nh->fib_nh_gw4, &gw);
-	if (info->dst_len == 32 && ctrl->cfg->host_route_write)
-		route = otto_l3_host_route_alloc(ctrl, &gw);
-	else
-		route = otto_l3_route_alloc(ctrl, &gw);
+	route = otto_l3_route_alloc(ctrl, &gw,
+				    info->dst_len == 32 && ctrl->cfg->host_route_write ?
+				    ROUTE_HOST : ROUTE_PREFIX);
 
 	if (route)
 		dev_info(ctrl->dev, "route hashtable extended for gw %pI4\n", &nh->fib_nh_gw4);
@@ -2213,7 +2170,7 @@ static int otto_l3_fib_trap_v6(struct otto_l3_ctrl *ctrl, struct fib6_info *rt,
 	if (route)
 		otto_l3_route_teardown(ctrl, route);
 
-	route = otto_l3_route_alloc(ctrl, &in6addr_any);
+	route = otto_l3_route_alloc(ctrl, &in6addr_any, ROUTE_PREFIX);
 	if (!route) {
 		dev_err(ctrl->dev, "no row to trap %pI6c/%d\n",
 			&rt->fib6_dst.addr, rt->fib6_dst.plen);
@@ -2278,6 +2235,14 @@ static struct otto_l3_route_src *otto_l3_route_src_find(struct otto_l3_route *r,
 	return NULL;
 }
 
+/* A source that could not be tracked is still a route the row stands for */
+static bool otto_l3_route_has_srcs(struct otto_l3_route *r)
+{
+	return !list_empty(&r->srcs) || r->srcs_incomplete;
+}
+
+static void otto_l3_resync_request(struct otto_l3_ctrl *ctrl);
+
 /* A source-specific route matches only the packets from its source, and the
  * hardware matches on the destination alone, so the destination traps for as
  * long as one of them remains. The trap row counts the members of each source
@@ -2321,8 +2286,17 @@ static int otto_l3_fib_add_v6_src(struct otto_l3_ctrl *ctrl, struct fib6_info *r
 	s = otto_l3_route_src_find(route, &rt->fib6_src);
 	if (!s) {
 		s = kzalloc(sizeof(*s), GFP_KERNEL);
-		if (!s)
+		if (!s) {
+			/* The row keeps trapping whatever the list says; a replay
+			 * builds the list again
+			 */
+			route->srcs_incomplete = true;
+			dev_err(ctrl->dev, "%pI6c/%d from %pI6c/%d: no memory to track the source\n",
+				&rt->fib6_dst.addr, rt->fib6_dst.plen,
+				&rt->fib6_src.addr, rt->fib6_src.plen);
+			otto_l3_resync_request(ctrl);
 			return -ENOMEM;
+		}
 		s->addr = rt->fib6_src.addr;
 		s->plen = rt->fib6_src.plen;
 		list_add_tail(&s->list, &route->srcs);
@@ -2355,7 +2329,7 @@ static int otto_l3_fib_del_v6_src(struct otto_l3_ctrl *ctrl, struct fib6_info *r
 	list_del(&s->list);
 	kfree(s);
 
-	if (list_empty(&route->srcs) && !route->members)
+	if (!otto_l3_route_has_srcs(route) && !route->members)
 		otto_l3_route_teardown(ctrl, route);
 
 	return 0;
@@ -2384,7 +2358,7 @@ static int otto_l3_add_catch_all(struct otto_l3_ctrl *ctrl, u8 type)
 {
 	struct otto_l3_route *route;
 
-	route = otto_l3_route_alloc(ctrl, &in6addr_any);
+	route = otto_l3_route_alloc(ctrl, &in6addr_any, ROUTE_PREFIX);
 	if (!route)
 		return -ENOSPC;
 
@@ -2432,7 +2406,7 @@ static int otto_l3_fib_add_v6(struct otto_l3_ctrl *ctrl, struct fib6_entry_notif
 	 */
 	route = otto_l3_route_find(ctrl, rt->fib6_table->tb6_id, ROUTE_TYPE_IP6UC,
 				   0, &rt->fib6_dst.addr, rt->fib6_dst.plen);
-	if (route && !list_empty(&route->srcs)) {
+	if (route && otto_l3_route_has_srcs(route)) {
 		route->members = members;
 		return 0;
 	}
@@ -2453,7 +2427,7 @@ static int otto_l3_fib_add_v6(struct otto_l3_ctrl *ctrl, struct fib6_entry_notif
 
 	vlan = is_vlan_dev(ndev) ? vlan_dev_vlan_id(ndev) : 0;
 
-	route = otto_l3_route_alloc(ctrl, gw);
+	route = otto_l3_route_alloc(ctrl, gw, ROUTE_PREFIX);
 	if (!route) {
 		dev_err(ctrl->dev, "could not extend route hashtable for gw %pI6c\n", gw);
 		goto out_failed;
@@ -2550,7 +2524,7 @@ static int otto_l3_fib_del_v6(struct otto_l3_ctrl *ctrl, struct fib6_entry_notif
 	if (route && ipv6_addr_any(&route->gw_ip)) {
 		if (route->members > members)
 			route->members -= members;
-		else if (!list_empty(&route->srcs))
+		else if (otto_l3_route_has_srcs(route))
 			route->members = 0;
 		else
 			otto_l3_route_teardown(ctrl, route);
@@ -3629,7 +3603,7 @@ static const struct of_device_id otto_l3_of_ids[] = {
 void otto_l3_remove(struct rtl838x_switch_priv *priv)
 {
 	struct otto_l3_ctrl *ctrl = priv->l3_ctrl;
-	struct otto_l3_route *r;
+	struct otto_l3_route *r, *tmp;
 
 	/* A replay would register the FIB notifier again */
 	disable_delayed_work_sync(&ctrl->resync_work);
@@ -3651,14 +3625,14 @@ void otto_l3_remove(struct rtl838x_switch_priv *priv)
 	flush_workqueue(priv->wq);
 
 	/* Nothing takes a route out now, and a FIB entry one still names would
-	 * be kept alive by it.
+	 * be kept alive by it. Destroying the hash table also waits for the
+	 * resize work it runs on its own.
 	 */
-	list_for_each_entry(r, &ctrl->routes_list, list) {
-		if (!IS_REACHABLE(CONFIG_IPV6) || !r->f6i)
-			continue;
-		fib6_info_release(r->f6i);
-		r->f6i = NULL;
-	}
+	rtnl_lock();
+	list_for_each_entry_safe(r, tmp, &ctrl->routes_list, list)
+		otto_l3_route_free(ctrl, r);
+	rtnl_unlock();
+	rhltable_destroy(&ctrl->routes);
 }
 
 struct otto_l3_flush_work {
@@ -3783,6 +3757,7 @@ int otto_l3_probe(struct device *dev, struct rtl838x_switch_priv *priv)
 	err = register_netevent_notifier(&ctrl->ne_nb);
 	if (err) {
 		ctrl->ne_nb.notifier_call = NULL;
+		otto_l3_remove(priv);
 		return dev_err_probe(dev, err, "Failed to register netevent notifier\n");
 	}
 
