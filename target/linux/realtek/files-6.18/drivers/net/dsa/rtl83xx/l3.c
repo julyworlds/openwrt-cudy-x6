@@ -47,7 +47,8 @@
  *   up to 1536 host routes. Trapped to the CPU: addresses of the box, on-link
  *   prefixes, blackhole, unreachable and prohibit routes, routes through a
  *   device outside the switch, a nexthop object or a lightweight tunnel,
- *   multipath routes and, for IPv6, source-specific and RA-learnt routes.
+ *   multipath routes, IPv4 routes for one DSCP value and, for IPv6,
+ *   source-specific and RA-learnt routes.
  *   Default routes have no entry, so their packets reach the CPU through the
  *   catch-all rows. Multicast routing is not offloaded, and all egress
  *   interfaces share one 1536 byte MTU. The programmed state is shown in
@@ -993,6 +994,7 @@ static int otto_l3_alloc_egress_intf(struct otto_l3_ctrl *ctrl, u64 mac, int vla
 		if (m == mac && ctrl->interfaces[i].vid == vlan) {
 			dev_dbg(ctrl->dev, "reusing egress interface %d for VLAN %d\n",
 				i, vlan);
+			ctrl->intf_refs[i]++;
 			mutex_unlock(ctrl->lock);
 			return i;
 		}
@@ -1018,6 +1020,7 @@ static int otto_l3_alloc_egress_intf(struct otto_l3_ctrl *ctrl, u64 mac, int vla
 	ctrl->interfaces[free_mac] = intf;
 
 	ctrl->cfg->set_egress_mac(ctrl, L3_EGRESS_DMACS + free_mac, mac);
+	ctrl->intf_refs[free_mac]++;
 
 	mutex_unlock(ctrl->lock);
 
@@ -1661,6 +1664,20 @@ struct otto_l3_route_src {
 	unsigned int members;
 };
 
+/* Drops the route's hold on its egress interface, and frees one no route
+ * holds any more by zeroing its source MAC, which is what
+ * otto_l3_alloc_egress_intf() takes for a free one.
+ */
+static void otto_l3_route_put_intf(struct otto_l3_ctrl *ctrl, struct otto_l3_route *r)
+{
+	mutex_lock(ctrl->lock);
+
+	if (r->nh.if_id >= 0 && !--ctrl->intf_refs[r->nh.if_id])
+		ctrl->cfg->set_egress_mac(ctrl, L3_EGRESS_DMACS + r->nh.if_id, 0);
+
+	mutex_unlock(ctrl->lock);
+}
+
 static void otto_l3_route_free(struct otto_l3_ctrl *ctrl, struct otto_l3_route *r)
 {
 	struct otto_l3_route_src *s, *tmp;
@@ -1766,6 +1783,14 @@ static void otto_l3_route_teardown(struct otto_l3_ctrl *ctrl, struct otto_l3_rou
 	dev_dbg(ctrl->dev, "releasing packet counter %d\n", r->pr.packet_cntr);
 	rtldsa_packet_cntr_free(priv, r->pr.packet_cntr);
 
+	/* Once the rows are not where the list says, after a failed move or a
+	 * lookup that timed out, the row of a prefix route may still be in
+	 * hardware and route through its egress interface: it keeps that for
+	 * good.
+	 */
+	if (r->is_host_route || !ctrl->prefix_rows_stale)
+		otto_l3_route_put_intf(ctrl, r);
+
 	otto_l3_route_free(ctrl, r);
 }
 
@@ -1803,6 +1828,7 @@ static struct otto_l3_route *otto_l3_route_alloc(struct otto_l3_ctrl *ctrl,
 	r->gw_ip = *gw;
 	r->pr.id = -1; /* We still need to allocate a rule in HW */
 	r->pr.packet_cntr = -1;
+	r->nh.if_id = -1;
 	r->is_host_route = host;
 	INIT_LIST_HEAD(&r->srcs);
 
@@ -1923,14 +1949,17 @@ static int otto_l3_fib_add_v4(struct otto_l3_ctrl *ctrl, struct fib_entry_notifi
 	/* A route through a nexthop object has no nexthop array to read, a
 	 * blackhole, unreachable or prohibit route has no device behind its
 	 * nexthop, a route with a lightweight tunnel (seg6, MPLS) needs the
-	 * CPU to encapsulate what the hardware would forward bare, and a
-	 * multipath route would be forwarded through its first next hop alone.
-	 * None is offloaded, but any can replace a route that is.
+	 * CPU to encapsulate what the hardware would forward bare, a multipath
+	 * route would be forwarded through its first next hop alone, and a route
+	 * for one DSCP value would carry every other value too, since the entry
+	 * matches on the destination only. None is offloaded, but any can
+	 * replace a route that is.
 	 */
 	if (info->fi->nh || !fib_info_nh(info->fi, 0)->fib_nh_dev ||
-	    fib_info_nh(info->fi, 0)->fib_nh_lws || fib_info_num_path(info->fi) > 1) {
+	    fib_info_nh(info->fi, 0)->fib_nh_lws || fib_info_num_path(info->fi) > 1 ||
+	    info->dscp) {
 		dev_dbg(ctrl->dev,
-			"route not offloaded: no device, nexthop object, tunnel or ECMP\n");
+			"route not offloaded: no device, nexthop object, tunnel, ECMP or DSCP\n");
 		route = otto_l3_route_find(ctrl, info->tb_id, ROUTE_TYPE_IP4UC, info->dst,
 					   NULL, info->dst_len);
 		if (route) {
@@ -2039,6 +2068,7 @@ static int otto_l3_fib_add_v4(struct otto_l3_ctrl *ctrl, struct fib_entry_notifi
 
 out_free_rmac:
 out_free_rt:
+	otto_l3_route_put_intf(ctrl, route);
 	otto_l3_route_free(ctrl, route);
 	return 0;
 }
@@ -2050,10 +2080,12 @@ static int otto_l3_fib_del_v4(struct otto_l3_ctrl *ctrl, struct fib_entry_notifi
 	struct fib_nh *nh;
 
 	/* A route through a nexthop object, without a device, with a
-	 * lightweight tunnel or with several paths holds at most a trap entry
+	 * lightweight tunnel, with several paths or for one DSCP value holds at
+	 * most a trap entry
 	 */
 	if (info->fi->nh || !fib_info_nh(info->fi, 0)->fib_nh_dev ||
-	    fib_info_nh(info->fi, 0)->fib_nh_lws || fib_info_num_path(info->fi) > 1) {
+	    fib_info_nh(info->fi, 0)->fib_nh_lws || fib_info_num_path(info->fi) > 1 ||
+	    info->dscp) {
 		route = otto_l3_route_find(ctrl, info->tb_id, ROUTE_TYPE_IP4UC, info->dst,
 					   NULL, info->dst_len);
 		if (route)
