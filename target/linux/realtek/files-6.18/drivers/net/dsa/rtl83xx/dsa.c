@@ -225,7 +225,7 @@ static int rtldsa_93xx_setup(struct dsa_switch *ds)
 	priv->r->pie_init(priv);
 
 	if (priv->r->pie_rule_id_is_log_counter) {
-		err = rtldsa_tc_init(priv);
+		err = otto_tc_init(priv);
 		if (err)
 			return err;
 	}
@@ -1358,7 +1358,7 @@ static bool rtldsa_83xx_lag_can_offload(struct dsa_switch *ds,
 	int id;
 
 	id = dsa_lag_id(ds->dst, lag);
-	if (id < 0 || id >= ds->num_lag_ids)
+	if (id < 1 || id > ds->num_lag_ids)
 		return false;
 
 	if (info->tx_type != NETDEV_LAG_TX_TYPE_HASH)
@@ -1418,9 +1418,15 @@ static int rtldsa_port_lag_join(struct dsa_switch *ds,
 		goto out;
 	}
 
-	group = dsa_lag_id(ds->dst, lag.dev);
+	group = lag.id - 1;
 
 	pr_info("port_lag_join: group %d, port %d\n", group, port);
+
+	err = otto_lag_add(priv->ds, group, port, info);
+	if (err) {
+		err = -EINVAL;
+		goto out;
+	}
 
 	if (priv->lag_primary[group] == -1)
 		priv->lag_primary[group] = port;
@@ -1428,13 +1434,7 @@ static int rtldsa_port_lag_join(struct dsa_switch *ds,
 		priv->lag_non_primary |= BIT_ULL(port);
 
 	priv->lagmembers |= BIT_ULL(port);
-
 	pr_debug("lag_members = %llX\n", priv->lagmembers);
-	err = otto_lag_add(priv->ds, group, port, info);
-	if (err) {
-		err = -EINVAL;
-		goto out;
-	}
 
 out:
 	mutex_unlock(&priv->reg_mutex);
@@ -1450,33 +1450,27 @@ static int rtldsa_port_lag_leave(struct dsa_switch *ds, int port,
 
 	mutex_lock(&priv->reg_mutex);
 
-	group = dsa_lag_id(ds->dst, lag.dev);
-	if (group == -1) {
-		pr_info("port_lag_leave: group %d not set\n", port);
-		err = -EINVAL;
-		goto out;
-	}
+	group = lag.id - 1;
 
 	if (port >= priv->r->cpu_port) {
 		err = -EINVAL;
 		goto out;
 	}
 	pr_info("port_lag_del: group %d, port %d\n", group, port);
+	err = otto_lag_del(priv->ds, group, port);
+	if (err)
+		goto out;
+
 	priv->lagmembers &= ~BIT_ULL(port);
 	priv->lag_non_primary &= ~BIT_ULL(port);
 	pr_debug("lag_members = %llX\n", priv->lagmembers);
-	err = otto_lag_del(priv->ds, group, port);
-	if (err) {
-		err = -EINVAL;
-		goto out;
-	}
 
-	/* To re-elect primary interface, just remove the first interface in
-	 * this-group's interfaces from non-primary
-	 */
-	if (priv->lags_port_members[group]) {
-		priv->lag_primary[group] = fls64(priv->lags_port_members[group]);
-		priv->lag_non_primary &= ~BIT_ULL(priv->lag_primary[group]);
+	if (priv->lag_primary[group] == port) {
+		u64 members = priv->lags_port_members[group];
+
+		priv->lag_primary[group] = members ? __ffs64(members) : -1;
+		if (members)
+			priv->lag_non_primary &= ~BIT_ULL(priv->lag_primary[group]);
 	}
 
 	/* No need to update fdb entries since they make use of trunk_id for entry.
@@ -1486,7 +1480,7 @@ static int rtldsa_port_lag_leave(struct dsa_switch *ds, int port,
 
 out:
 	mutex_unlock(&priv->reg_mutex);
-	return 0;
+	return err;
 }
 
 const struct phylink_mac_ops rtldsa_83xx_phylink_mac_ops = {
@@ -1612,7 +1606,7 @@ const struct dsa_switch_ops rtldsa_93xx_switch_ops = {
 	.port_pre_bridge_flags	= rtldsa_port_pre_bridge_flags,
 	.port_bridge_flags	= rtldsa_port_bridge_flags,
 
-	.cls_flower_add		= rtldsa_cls_flower_add,
-	.cls_flower_del		= rtldsa_cls_flower_del,
-	.cls_flower_stats	= rtldsa_cls_flower_stats,
+	.cls_flower_add		= otto_tc_cls_flower_add,
+	.cls_flower_del		= otto_tc_cls_flower_del,
+	.cls_flower_stats	= otto_tc_cls_flower_stats,
 };
