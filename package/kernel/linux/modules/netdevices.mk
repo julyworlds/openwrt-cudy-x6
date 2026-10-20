@@ -190,8 +190,8 @@ define KernelPackage/libphy
 	   CONFIG_PHYLIB_LEDS=y \
 	   CONFIG_MDIO_BUS
   FILES:=$(LINUX_DIR)/drivers/net/phy/libphy.ko \
-    $(LINUX_DIR)/drivers/net/phy/mdio-bus.ko@ge6.18
-  AUTOLOAD:=$(call AutoLoad,15,libphy mdio-bus@ge6.18,1)
+    $(LINUX_DIR)/drivers/net/phy/mdio-bus.ko
+  AUTOLOAD:=$(call AutoLoad,15,libphy mdio-bus,1)
 endef
 
 define KernelPackage/libphy/description
@@ -2259,7 +2259,7 @@ $(eval $(call KernelPackage,hinic))
 define KernelPackage/hinic3
   SUBMENU:=$(NETWORK_DEVICES_MENU)
   TITLE:=Huawei 3rd generation network adapters (HINIC3) support
-  DEPENDS:=@PCI_SUPPORT @TARGET_x86||TARGET_armsr_armv8 @LINUX_6_18
+  DEPENDS:=@PCI_SUPPORT @TARGET_x86||TARGET_armsr_armv8
   FILES:=$(LINUX_DIR)/drivers/net/ethernet/huawei/hinic3/hinic3.ko
   KCONFIG:=CONFIG_HINIC3
   AUTOLOAD:=$(call AutoProbe,hinic3)
@@ -2448,7 +2448,7 @@ $(eval $(call KernelPackage,lan743x))
 define KernelPackage/amazon-ena
   SUBMENU:=$(NETWORK_DEVICES_MENU)
   TITLE:=Elastic Network Adapter (for Amazon AWS)
-  DEPENDS:=@TARGET_x86_64||TARGET_armsr +LINUX_6_18:kmod-ptp
+  DEPENDS:=@TARGET_x86_64||TARGET_armsr +kmod-ptp
   KCONFIG:=CONFIG_ENA_ETHERNET
   FILES:=$(LINUX_DIR)/drivers/net/ethernet/amazon/ena/ena.ko
   AUTOLOAD:=$(call AutoLoad,12,ena)
