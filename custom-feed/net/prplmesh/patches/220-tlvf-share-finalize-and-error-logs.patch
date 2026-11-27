@@ -1,0 +1,172 @@
+From: prplmesh OpenWrt package
+Subject: [PATCH] tlvf: share finalize() and buffer increment error logging
+
+The generator emitted the same finalize() body and a separate
+"buffPtrIncrementSafe(...) Failed!" log statement for every class and
+field (670 and 2100 copies). Move both into BaseClass
+(finalize_begin(), buffPtrIncrementSafeOrLog()) and let the generated
+code call them. Behaviour and log messages are unchanged.
+
+--- a/framework/tlvf/src/include/tlvf/BaseClass.h
++++ b/framework/tlvf/src/include/tlvf/BaseClass.h
+@@ -27,6 +27,9 @@
+     uint8_t *getStartBuffPtr();
+     size_t getBuffRemainingBytes(void *start = nullptr);
+     bool buffPtrIncrementSafe(size_t length);
++    // Same as buffPtrIncrementSafe(), but logs the failure. Used by the
++    // generated code so the error message exists once instead of per field.
++    bool buffPtrIncrementSafeOrLog(size_t length);
+ 
+     size_t getLen();
+     bool isInitialized();
+@@ -56,6 +59,14 @@
+     }
+ 
+ protected:
++    /**
++     * Common part of the generated finalize() methods.
++     * @return -1 on failure, 0 if there is nothing left to do (parsing or
++     * already finalized), 1 if the caller must adjust its length by
++     * @a tailroom, swap and mark itself finalized.
++     */
++    int finalize_begin(size_t &tailroom);
++
+     uint8_t *m_buff__;
+     uint8_t *m_buff_ptr__;
+     const size_t m_buff_len__;
+--- a/framework/tlvf/src/src/BaseClass.cpp
++++ b/framework/tlvf/src/src/BaseClass.cpp
+@@ -42,3 +42,38 @@
+     m_buff_ptr__ += length;
+     return true;
+ }
++
++bool BaseClass::buffPtrIncrementSafeOrLog(size_t length)
++{
++    if (!buffPtrIncrementSafe(length)) {
++        LOG(ERROR) << "buffPtrIncrementSafe(" << std::dec << length << ") Failed!";
++        return false;
++    }
++    return true;
++}
++
++int BaseClass::finalize_begin(size_t &tailroom)
++{
++    tailroom = 0;
++    if (m_parse__) {
++        TLVF_LOG(DEBUG) << "finalize() called but m_parse__ is set";
++        return 0;
++    }
++    if (m_finalized__) {
++        TLVF_LOG(DEBUG) << "finalize() called for already finalized class";
++        return 0;
++    }
++    if (!isPostInitSucceeded()) {
++        TLVF_LOG(ERROR) << "post init check failed";
++        return -1;
++    }
++    if (m_inner__) {
++        if (!m_inner__->finalize()) {
++            TLVF_LOG(ERROR) << "m_inner__->finalize() failed";
++            return -1;
++        }
++        tailroom = m_inner__->getMessageBuffLength() - m_inner__->getMessageLength();
++        m_buff_ptr__ -= tailroom;
++    }
++    return 1;
++}
+--- a/framework/tlvf/tlvf.py
++++ b/framework/tlvf/tlvf.py
+@@ -17,6 +17,7 @@
+ import argparse
+ import sys
+ import os
++import re
+ import yaml
+ import yaml.constructor
+ import pprint
+@@ -2052,42 +2053,19 @@
+         self.insertLineH(insert_name, insert_marker, "%sbool finalize() override;" %
+                          self.getIndentation(2))
+ 
++        # The checks and the inner list handling live in
++        # BaseClass::finalize_begin() so they are not duplicated per class.
+         self.insertLineCpp(insert_name, insert_marker, "bool %s::finalize()" % (name))
+         self.insertLineCpp(insert_name, insert_marker, "{")
+         self.insertLineCpp(insert_name, insert_marker,
+-                           "%sif (m_parse__) {" % (self.getIndentation(1)))
++                           "%ssize_t tailroom;" % (self.getIndentation(1)))
+         self.insertLineCpp(insert_name, insert_marker,
+-                           '%sTLVF_LOG(DEBUG) << "finalize() called but m_parse__ is set";' % self.getIndentation(2))
+-        self.insertLineCpp(insert_name, insert_marker, "%sreturn true;" % self.getIndentation(2))
+-        self.insertLineCpp(insert_name, insert_marker, "%s}" % self.getIndentation(1))
+-        self.insertLineCpp(insert_name, insert_marker,
+-                           "%sif (m_finalized__) {" % (self.getIndentation(1)))
+-        self.insertLineCpp(insert_name, insert_marker,
+-                           '%sTLVF_LOG(DEBUG) << "finalize() called for already finalized class";' % self.getIndentation(2))
+-        self.insertLineCpp(insert_name, insert_marker, "%sreturn true;" % self.getIndentation(2))
+-        self.insertLineCpp(insert_name, insert_marker, "%s}" % self.getIndentation(1))
+-        self.insertLineCpp(insert_name, insert_marker,
+-                           "%sif (!isPostInitSucceeded()) {" % (self.getIndentation(1)))
+-        self.insertLineCpp(insert_name, insert_marker,
+-                           '%sTLVF_LOG(ERROR) << "post init check failed";' % self.getIndentation(2))
+-        self.insertLineCpp(insert_name, insert_marker, "%sreturn false;" % self.getIndentation(2))
+-        self.insertLineCpp(insert_name, insert_marker, "%s}" % self.getIndentation(1))
++                           "%sint ret = finalize_begin(tailroom);" % (self.getIndentation(1)))
+         self.insertLineCpp(insert_name, insert_marker,
+-                           "%sif (m_inner__) {" % (self.getIndentation(1)))
+-        self.insertLineCpp(insert_name, insert_marker,
+-                           "%sif (!m_inner__->finalize()) {" % self.getIndentation(2))
+-        self.insertLineCpp(insert_name, insert_marker,
+-                           '%sTLVF_LOG(ERROR) << "m_inner__->finalize() failed";' % self.getIndentation(3))
+-        self.insertLineCpp(insert_name, insert_marker, "%sreturn false;" % self.getIndentation(3))
+-        self.insertLineCpp(insert_name, insert_marker, "%s}" % self.getIndentation(2))
+-        self.insertLineCpp(insert_name, insert_marker,
+-                           "%sauto tailroom = m_inner__->getMessageBuffLength() - m_inner__->getMessageLength();" % self.getIndentation(2))
+-        self.insertLineCpp(insert_name, insert_marker,
+-                           "%sm_buff_ptr__ -= tailroom;" % (self.getIndentation(2)))
++                           "%sif (ret <= 0) { return ret == 0; }" % (self.getIndentation(1)))
+         if obj_meta.is_tlv_class:
+             self.insertLineCpp(insert_name, insert_marker,
+-                               "%s*m_length -= tailroom;" % (self.getIndentation(2)))
+-        self.insertLineCpp(insert_name, insert_marker, "%s}" % self.getIndentation(1))
++                               "%s*m_length -= tailroom;" % (self.getIndentation(1)))
+         self.insertLineCpp(insert_name, insert_marker, "%sclass_swap();" % (self.getIndentation(1)))
+         self.insertLineCpp(insert_name, insert_marker, "%sm_finalized__ = true;" %
+                            (self.getIndentation(1)))
+@@ -2243,6 +2221,26 @@
+             return False
+         return True
+ 
++    BUFF_INC_IF_RE = re.compile(r'^(\s*)if \((.*)!buffPtrIncrementSafe\((.*)\)\) \{$')
++    BUFF_INC_LOG_RE = re.compile(r'^\s*LOG\(ERROR\) << "buffPtrIncrementSafe\(" << std::dec << .* << "\) Failed!";$')
++
++    def compactBuffIncrementLogs(self, code_lines):
++        # "if (!buffPtrIncrementSafe(x)) { LOG(ERROR) << ...; return false; }"
++        # -> "if (!buffPtrIncrementSafeOrLog(x)) { return false; }"
++        out = []
++        i = 0
++        while i < len(code_lines):
++            line = code_lines[i]
++            m = self.BUFF_INC_IF_RE.match(line)
++            if m and i + 1 < len(code_lines) and self.BUFF_INC_LOG_RE.match(code_lines[i + 1]):
++                out.append("%sif (%s!buffPtrIncrementSafeOrLog(%s)) {" %
++                           (m.group(1), m.group(2), m.group(3)))
++                i += 2
++                continue
++            out.append(line)
++            i += 1
++        return out
++
+     def writeFile(self, code_lines, file_suffix):
+         if file_suffix == ".h":
+             file_path = os.path.join(self.conf_output_path_include, self.yaml_path)
+@@ -2287,6 +2285,8 @@
+                     tmp_list.append(inc_name)
+                     self.insertLineH("", self.CODE_INCLUDE_INSERT, '#include %s' % inc_name)
+ 
++        if file_suffix != ".h":
++            code_lines = self.compactBuffIncrementLogs(code_lines)
+         lines.extend(code_lines)
+ 
+         # write code

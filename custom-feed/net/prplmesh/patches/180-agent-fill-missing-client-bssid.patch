@@ -1,0 +1,36 @@
+From: OpenWrt prplmesh package
+Subject: [PATCH] agent: fill a missing client BSSID from the reporting VAP
+
+On stock OpenWrt the nl80211 HAL reports STA_Connected with an all-zero
+BSSID in two cases: stations imported by the STA-FIRST/STA-NEXT sweep of
+already connected clients, and live associations when hostapd did not
+hand over the (re)association frame (notify_mgmt_frames=0, the stock
+default). The agent then finds no radio for the zero BSSID and drops the
+association, so the controller never learns about the client and client
+steering cannot work.
+
+The VAP the station was reported on is always known: use its MAC as the
+BSSID when the HAL did not provide one.
+
+---
+--- a/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
++++ b/agent/src/beerocks/fronthaul_manager/ap_manager/ap_manager.cpp
+@@ -2807,6 +2807,18 @@
+         notification->bssid()        = msg->params.bssid;
+         notification->capabilities() = msg->params.capabilities;
+ 
++        // On stock OpenWrt hostapd may not hand the (re)association frame to
++        // the HAL, and the STA-FIRST/STA-NEXT sweep of already connected
++        // stations carries no BSSID at all. A zero BSSID makes the agent drop
++        // the association (no radio matches it), so the client never reaches
++        // the controller. The VAP the station was reported on is known: use
++        // its MAC as the BSSID.
++        if (notification->bssid() == beerocks::net::network_utils::ZERO_MAC) {
++            notification->bssid() = tlvf::mac_from_string(vap_node->second.mac);
++            LOG(DEBUG) << "STA_Connected without BSSID, using VAP " << vap_node->second.bss
++                       << " BSSID " << notification->bssid();
++        }
++
+         notification->multi_ap_profile()   = msg->params.multi_ap_profile;
+         notification->is_mlo()             = msg->params.is_mlo;
+         notification->mlo_modes()          = msg->params.mlo_modes;

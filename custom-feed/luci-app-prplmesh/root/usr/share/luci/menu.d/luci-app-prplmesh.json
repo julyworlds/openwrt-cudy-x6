@@ -1,0 +1,29 @@
+{
+	"admin/network/prplmesh": {
+		"title": "EasyMesh",
+		"order": 60,
+		"action": {
+			"type": "firstchild"
+		},
+		"depends": {
+			"acl": [ "luci-app-prplmesh" ],
+			"uci": { "prplmesh": true }
+		}
+	},
+	"admin/network/prplmesh/status": {
+		"title": "Status",
+		"order": 10,
+		"action": {
+			"type": "view",
+			"path": "prplmesh/status"
+		}
+	},
+	"admin/network/prplmesh/settings": {
+		"title": "Settings",
+		"order": 20,
+		"action": {
+			"type": "view",
+			"path": "prplmesh/settings"
+		}
+	}
+}

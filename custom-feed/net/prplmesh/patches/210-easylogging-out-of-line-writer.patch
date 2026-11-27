@@ -1,0 +1,148 @@
+From: prplmesh OpenWrt package
+Subject: [PATCH] easylogging: keep LOG() call sites small
+
+Every LOG()/CLOG() call site inlined the Writer constructor, destructor
+and one MessageBuilder::operator<< per streamed value, and stored a
+__PRETTY_FUNCTION__ string that the prplMesh log format (%fbase:%line)
+never prints. With thousands of log statements (7000+ in the generated
+TLV code alone) this was a large part of the binaries.
+
+Move the Writer constructors/destructor and the operator<< overloads for
+the common scalar/string types and stream manipulators out of line and
+drop the function name string. Output is unchanged; other types still use
+the template path.
+
+--- a/framework/external/easylogging/easylogging++.cc
++++ b/framework/external/easylogging/easylogging++.cc
+@@ -2585,6 +2585,56 @@
+   return *this;
+ }
+ 
++Writer::Writer(Level level, const char* file, base::type::LineNumber line,
++               const char* func, base::DispatchAction dispatchAction,
++               base::type::VerboseLevel verboseLevel) :
++  m_msg(nullptr), m_level(level), m_file(file), m_line(line), m_func(func), m_verboseLevel(verboseLevel),
++  m_logger(nullptr), m_proceed(false), m_dispatchAction(dispatchAction) {
++}
++
++Writer::Writer(LogMessage* msg, base::DispatchAction dispatchAction) :
++  m_msg(msg), m_level(msg != nullptr ? msg->level() : Level::Unknown),
++  m_line(0), m_logger(nullptr), m_proceed(false), m_dispatchAction(dispatchAction) {
++}
++
++Writer::~Writer(void) {
++  processDispatch();
++}
++
++#if ELPP_LOGGING_ENABLED
++#  define ELPP_WRITER_OUT_OF_LINE(TYPE) \
++Writer& Writer::operator<<(TYPE log) { \
++  if (m_proceed) { \
++    m_messageBuilder << log; \
++  } \
++  return *this; \
++}
++#else
++#  define ELPP_WRITER_OUT_OF_LINE(TYPE) \
++Writer& Writer::operator<<(TYPE) { return *this; }
++#endif  // ELPP_LOGGING_ENABLED
++ELPP_WRITER_OUT_OF_LINE(const char*)
++ELPP_WRITER_OUT_OF_LINE(const std::string&)
++ELPP_WRITER_OUT_OF_LINE(char)
++ELPP_WRITER_OUT_OF_LINE(signed char)
++ELPP_WRITER_OUT_OF_LINE(unsigned char)
++ELPP_WRITER_OUT_OF_LINE(bool)
++ELPP_WRITER_OUT_OF_LINE(short)
++ELPP_WRITER_OUT_OF_LINE(unsigned short)
++ELPP_WRITER_OUT_OF_LINE(int)
++ELPP_WRITER_OUT_OF_LINE(unsigned int)
++ELPP_WRITER_OUT_OF_LINE(long)
++ELPP_WRITER_OUT_OF_LINE(unsigned long)
++ELPP_WRITER_OUT_OF_LINE(long long)
++ELPP_WRITER_OUT_OF_LINE(unsigned long long)
++ELPP_WRITER_OUT_OF_LINE(double)
++ELPP_WRITER_OUT_OF_LINE(const void*)
++typedef std::ostream& (*ElppOStreamManip)(std::ostream&);
++typedef std::ios_base& (*ElppIosManip)(std::ios_base&);
++ELPP_WRITER_OUT_OF_LINE(ElppOStreamManip)
++ELPP_WRITER_OUT_OF_LINE(ElppIosManip)
++#undef ELPP_WRITER_OUT_OF_LINE
++
+ Writer& Writer::construct(int count, const char* loggerIds, ...) {
+   if (ELPP->hasFlag(LoggingFlag::MultiLoggerSupport)) {
+     va_list loggersList;
+--- a/framework/external/easylogging/easylogging++.h
++++ b/framework/external/easylogging/easylogging++.h
+@@ -285,7 +285,9 @@
+ #if ELPP_COMPILER_MSVC  // Visual C++
+ #  define ELPP_FUNC __FUNCSIG__
+ #elif ELPP_COMPILER_GCC  // GCC
+-#  define ELPP_FUNC __PRETTY_FUNCTION__
++// prplMesh: the log format never uses %func, but __PRETTY_FUNCTION__ would
++// still store one full C++ signature string per log call site.
++#  define ELPP_FUNC ""
+ #elif ELPP_COMPILER_INTEL  // Intel C++
+ #  define ELPP_FUNC __PRETTY_FUNCTION__
+ #elif ELPP_COMPILER_CLANG  // Clang++
+@@ -3233,21 +3235,34 @@
+ /// @brief Main entry point of each logging
+ class Writer : base::NoCopy {
+  public:
++  // prplMesh: constructors, destructor and the operator<< overloads for the
++  // common types are out of line, so every LOG() call site emits a few calls
++  // instead of an inlined copy of the whole formatting path.
+   Writer(Level level, const char* file, base::type::LineNumber line,
+          const char* func, base::DispatchAction dispatchAction = base::DispatchAction::NormalLog,
+-         base::type::VerboseLevel verboseLevel = 0) :
+-    m_msg(nullptr), m_level(level), m_file(file), m_line(line), m_func(func), m_verboseLevel(verboseLevel),
+-    m_logger(nullptr), m_proceed(false), m_dispatchAction(dispatchAction) {
+-  }
++         base::type::VerboseLevel verboseLevel = 0);
+ 
+-  Writer(LogMessage* msg, base::DispatchAction dispatchAction = base::DispatchAction::NormalLog) :
+-    m_msg(msg), m_level(msg != nullptr ? msg->level() : Level::Unknown),
+-    m_line(0), m_logger(nullptr), m_proceed(false), m_dispatchAction(dispatchAction) {
+-  }
++  Writer(LogMessage* msg, base::DispatchAction dispatchAction = base::DispatchAction::NormalLog);
+ 
+-  virtual ~Writer(void) {
+-    processDispatch();
+-  }
++  virtual ~Writer(void);
++
++  Writer& operator<<(const char* log);
++  Writer& operator<<(const std::string& log);
++  Writer& operator<<(char log);
++  Writer& operator<<(signed char log);
++  Writer& operator<<(unsigned char log);
++  Writer& operator<<(bool log);
++  Writer& operator<<(short log);
++  Writer& operator<<(unsigned short log);
++  Writer& operator<<(int log);
++  Writer& operator<<(unsigned int log);
++  Writer& operator<<(long log);
++  Writer& operator<<(unsigned long log);
++  Writer& operator<<(long long log);
++  Writer& operator<<(unsigned long long log);
++  Writer& operator<<(double log);
++  Writer& operator<<(const void* log);
++  Writer& operator<<(std::ios_base& (*log)(std::ios_base&));
+ 
+   template <typename T>
+   typename std::enable_if<not std::is_enum<T>::value, Writer&>::type
+@@ -3266,14 +3281,7 @@
+     return *this << static_cast<typename std::underlying_type<T>::type>(e);
+   }
+ 
+-  inline Writer& operator<<(std::ostream& (*log)(std::ostream&)) {
+-#if ELPP_LOGGING_ENABLED
+-    if (m_proceed) {
+-      m_messageBuilder << log;
+-    }
+-#endif  // ELPP_LOGGING_ENABLED
+-    return *this;
+-  }
++  Writer& operator<<(std::ostream& (*log)(std::ostream&));
+ 
+   inline operator bool() {
+     return true;

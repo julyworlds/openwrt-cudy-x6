@@ -1,0 +1,22 @@
+{
+	"luci-app-prplmesh": {
+		"description": "Grant access to prplMesh (EasyMesh) status and settings",
+		"read": {
+			"uci": [ "prplmesh", "wireless" ],
+			"ubus": {
+				"service": [ "list" ]
+			},
+			"file": {
+				"/var/run/hostapd": [ "list" ],
+				"/usr/libexec/prplmesh/bin/beerocks_cli -c bml_conn_map": [ "exec" ]
+			}
+		},
+		"write": {
+			"uci": [ "prplmesh" ],
+			"file": {
+				"/usr/libexec/prplmesh/bin/beerocks_cli -c steer_client *": [ "exec" ],
+				"/etc/init.d/prplmesh restart": [ "exec" ]
+			}
+		}
+	}
+}
