@@ -1,0 +1,155 @@
+From: prplmesh OpenWrt package
+Subject: [PATCH] controller: track and show client 11k/11v support
+
+Roaming needs to know whether a client supports 802.11k beacon reports
+and 802.11v BSS transition. The controller learns it from the
+(re)association frame in the Client Capability Report, but only asked
+for it on a Client Association Event; clients only seen in the
+Associated Clients TLV (already connected when prplMesh started) never
+got it. Send a Client Capability Query for those too.
+
+Expose the result in BML (the spare byte of BML_NODE, so the struct size
+is unchanged) and print it in bml_conn_map as ", 11k: 0|1|?, 11v: 0|1"
+when known. STA_CAPS_RRM_UNKNOWN marks stations whose 11k support is not
+known (capabilities not taken from an association frame).
+
+--- a/common/beerocks/bcl/include/bcl/beerocks_message_structs.h
++++ b/common/beerocks/bcl/include/bcl/beerocks_message_structs.h
+@@ -119,6 +119,12 @@
+     }
+ } __attribute__((packed)) sRadioCapabilities;
+ 
++// sRadioCapabilities::rrm_supported when it is unknown whether the station
++// supports Radio Measurement (capabilities not taken from its (re)association
++// frame, e.g. read from hostapd for a station associated before the agent
++// started). Callers that try 11k measurements treat it as "maybe".
++constexpr uint8_t STA_CAPS_RRM_UNKNOWN = 0xff;
++
+ typedef struct sWifiChannel {
+     uint8_t channel           = 0;
+     int8_t noise              = 0;
+--- a/controller/src/beerocks/bml/bml_defs.h
++++ b/controller/src/beerocks/bml/bml_defs.h
+@@ -173,6 +173,12 @@
+ /**
+  * A structure representing a node in the network map.
+  */
++/* BML_NODE::client_caps */
++#define BML_CLIENT_CAPS_KNOWN 0x01 /* capabilities known (from the (re)association frame) */
++#define BML_CLIENT_CAPS_11K 0x02   /* 802.11k beacon reports (active or passive) */
++#define BML_CLIENT_CAPS_11V 0x04   /* 802.11v BSS transition management */
++#define BML_CLIENT_CAPS_11K_UNKNOWN 0x08 /* 802.11k support not known */
++
+ struct BML_NODE {
+ 
+     /* The type of the node (GW, IRE or CLIENT) */
+@@ -217,8 +223,11 @@
+     /* Wired/Wireless backhaul*/
+     bool isWiFiBH;
+ 
++    /* Client capabilities, BML_CLIENT_CAPS_* (clients only) */
++    uint8_t client_caps;
++
+     /* Reserved bytes for alignment */
+-    uint8_t reserved[2];
++    uint8_t reserved[1];
+ 
+     /* Extra information for the specific node. */
+     union N_DATA {
+--- a/controller/src/beerocks/master/db/network_map.cpp
++++ b/controller/src/beerocks/master/db/network_map.cpp
+@@ -288,6 +288,32 @@
+             tlvf::mac_to_array(parent_agent->al_mac, node->parent_bridge);
+         }
+         tlvf::mac_to_array(parent_bss->bssid, node->parent_bssid);
++
++        // Capabilities of the band the client is connected on.
++        const beerocks::message::sRadioCapabilities *caps;
++        switch (parent_bss->radio.get_band()) {
++        case beerocks::FREQ_5G:
++            caps = &station->m_sta_5ghz_capabilities;
++            break;
++        case beerocks::FREQ_6G:
++            caps = &station->m_sta_6ghz_capabilities;
++            break;
++        default:
++            caps = &station->m_sta_24ghz_capabilities;
++            break;
++        }
++        if (caps->valid) {
++            node->client_caps = BML_CLIENT_CAPS_KNOWN;
++            if (caps->rrm_supported == beerocks::message::STA_CAPS_RRM_UNKNOWN) {
++                node->client_caps |= BML_CLIENT_CAPS_11K_UNKNOWN;
++            } else if (caps->rrm_supported &&
++                       (caps->beacon_report_active || caps->beacon_report_passive)) {
++                node->client_caps |= BML_CLIENT_CAPS_11K;
++            }
++            if (caps->btm_supported) {
++                node->client_caps |= BML_CLIENT_CAPS_11V;
++            }
++        }
+     }
+ 
+     node->rx_rssi = database.get_sta_load_rx_rssi(tlvf::mac_to_string(station->mac));
+--- a/controller/src/beerocks/cli/beerocks_cli_bml.h
++++ b/controller/src/beerocks/cli/beerocks_cli_bml.h
+@@ -31,6 +31,7 @@
+         uint8_t channel_ext_above_secondary;
+         int8_t rx_rssi;
+         bool isWiFiBH;
++        uint8_t client_caps = 0;
+         std::string mac;
+         bool status;
+         std::string ip_v4;
+--- a/controller/src/beerocks/cli/beerocks_cli_bml.cpp
++++ b/controller/src/beerocks/cli/beerocks_cli_bml.cpp
+@@ -36,6 +36,7 @@
+     n->channel_ext_above_secondary = node->channel_ext_above_secondary;
+     n->rx_rssi                     = node->rx_rssi;
+     n->isWiFiBH                    = node->isWiFiBH;
++    n->client_caps                 = node->client_caps;
+     n->mac                         = tlvf::mac_to_string(node->mac);
+     n->status                      = node->status;
+     n->ip_v4                       = network_utils::ipv4_to_string(node->ip_v4);
+@@ -154,6 +155,13 @@
+             if (node->channel || node->rx_rssi != beerocks::RSSI_INVALID) {
+                 ss << ", rx_rssi: " << std::to_string(node->rx_rssi);
+             }
++            if (node->client_caps & BML_CLIENT_CAPS_KNOWN) {
++                ss << ", 11k: "
++                   << ((node->client_caps & BML_CLIENT_CAPS_11K_UNKNOWN)
++                           ? "?"
++                           : ((node->client_caps & BML_CLIENT_CAPS_11K) ? "1" : "0"))
++                   << ", 11v: " << ((node->client_caps & BML_CLIENT_CAPS_11V) ? 1 : 0);
++            }
+             ss << std::endl;
+ 
+         } else { //PLATFORM
+--- a/controller/src/beerocks/master/tasks/topology_task.cpp
++++ b/controller/src/beerocks/master/tasks/topology_task.cpp
+@@ -10,6 +10,7 @@
+ #include "topology_task.h"
+ #include "../db/db_algo.h"
+ #include "../son_actions.h"
++#include <tlvf/wfa_map/tlvClientInfo.h>
+ #include "bml_task.h"
+ #include "btm_request_task.h"
+ #include "client_steering_task.h"
+@@ -877,6 +878,17 @@
+         database.set_sta_backhaul_iface_type(mac, beerocks::IFACE_TYPE_WIFI_UNSPECIFIED);
+         son_actions::handle_completed_connection(database, cmdu_tx, tasks,
+                                                  tlvf::mac_to_string(mac));
++
++        // No (re)association frame was seen for it: ask the agent for its
++        // capabilities (11k/11v support is needed to decide how to roam it).
++        if (cmdu_tx.create(0, ieee1905_1::eMessageType::CLIENT_CAPABILITY_QUERY_MESSAGE)) {
++            auto client_info = cmdu_tx.addClass<wfa_map::tlvClientInfo>();
++            if (client_info) {
++                client_info->client_mac() = mac;
++                client_info->bssid()      = bssid;
++                son_actions::send_cmdu_to_agent(agent.al_mac, cmdu_tx, database);
++            }
++        }
+     }
+ 
+     // Remove previously connected stations that are not connected anymore
