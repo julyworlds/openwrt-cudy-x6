@@ -1,0 +1,53 @@
+From: prplmesh OpenWrt package
+Subject: [PATCH] controller: record the 11k probe result
+
+The association handling task probes 11k support with a beacon request.
+When the station's 11k support was unknown (STA_CAPS_RRM_UNKNOWN,
+capabilities not taken from its association frame), store the outcome in
+its capabilities so BML and the web UI show it.
+
+--- a/controller/src/beerocks/master/tasks/association_handling_task.cpp
++++ b/controller/src/beerocks/master/tasks/association_handling_task.cpp
+@@ -365,6 +365,7 @@
+             }
+             database.set_sta_beacon_measurement_support_level(
+                 sta_mac, beerocks::eBeaconMeasurementSupportLevel(support_level));
++            record_11k_probe_result(true);
+             state = REQUEST_RSSI_MEASUREMENT_WAIT;
+             break;
+         }
+@@ -481,6 +482,7 @@
+                             << " as beacon measurement unsupported ";
+             database.set_sta_beacon_measurement_support_level(sta_mac,
+                                                               beerocks::BEACON_MEAS_UNSUPPORTED);
++            record_11k_probe_result(false);
+             state = REQUEST_RSSI_MEASUREMENT_WAIT;
+         }
+         break;
+@@ -491,3 +493,15 @@
+     }
+     }
+ }
++
++void association_handling_task::record_11k_probe_result(bool supported)
++{
++    // When the station's 11k support wasn't known (capabilities not taken
++    // from its association frame), keep what the probe found so BML and the
++    // web UI show it.
++    auto station = database.get_station(tlvf::mac_from_string(sta_mac));
++    if (station && station->capabilities &&
++        station->capabilities->rrm_supported == beerocks::message::STA_CAPS_RRM_UNKNOWN) {
++        station->capabilities->rrm_supported = supported ? 1 : 0;
++    }
++}
+--- a/controller/src/beerocks/master/tasks/association_handling_task.h
++++ b/controller/src/beerocks/master/tasks/association_handling_task.h
+@@ -31,6 +31,8 @@
+         override;
+ 
+ private:
++    /** @brief Store the 11k probe result in the station capabilities if it was unknown. */
++    void record_11k_probe_result(bool supported);
+     void finalize_new_connection();
+ 
+     db &database;

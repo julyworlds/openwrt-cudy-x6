@@ -1,0 +1,61 @@
+From: prplmesh OpenWrt package
+Subject: [PATCH] controller: evaluate roaming candidates
+
+When a client's uplink RSSI is below the roaming threshold of its radio
+(patch 280), start the optimal path task for it: 11k or cross
+measurements, then an 11v request if another access point is clearly
+better. At most once a minute per client, and not for clients known not
+to support 11v (they can't be moved without disconnecting them).
+
+--- a/controller/src/beerocks/master/controller.h
++++ b/controller/src/beerocks/master/controller.h
+@@ -745,6 +745,9 @@
+ 
+     db &database;
+     task_pool m_task_pool;
++
++    /** Earliest time each roaming candidate may be evaluated again. */
++    std::unordered_map<sMacAddr, std::chrono::steady_clock::time_point> m_roaming_next_check;
+     periodic_operation_pool operations;
+     beerocks::controller_ucc_listener m_controller_ucc_listener;
+ 
+--- a/controller/src/beerocks/master/controller.cpp
++++ b/controller/src/beerocks/master/controller.cpp
+@@ -2470,11 +2470,32 @@
+         if (station && !station->is_bSta() && radio && rcpi > 0 && rcpi <= beerocks::RCPI_MAX) {
+             auto threshold = radio->metric_reporting_policies.sta_reporting_rcpi_threshold;
+             if (threshold && rcpi < threshold) {
+-                LOG(INFO) << "Roaming candidate " << sta_link_metric->sta_mac() << " on "
+-                          << bssid_info.bssid << ": RSSI "
+-                          << int(son::wireless_utils::convert_rssi_from_rcpi(rcpi))
+-                          << " dBm below threshold "
+-                          << int(son::wireless_utils::convert_rssi_from_rcpi(threshold)) << " dBm";
++                // Evaluate it (optimal path: 11k or cross measurements, then
++                // an 11v request if another AP is better), at most once a
++                // minute per client. Clients known not to support 11v can't
++                // be moved without disconnecting them, so they are left alone.
++                static constexpr auto ROAMING_CANDIDATE_COOLDOWN = std::chrono::seconds(60);
++                auto now          = std::chrono::steady_clock::now();
++                auto sta_mac_str  = tlvf::mac_to_string(sta_link_metric->sta_mac());
++                auto caps         = database.get_sta_current_capabilities(sta_mac_str);
++                bool btm_known_no = caps && caps->valid && !caps->btm_supported;
++                auto &next_check  = m_roaming_next_check[sta_link_metric->sta_mac()];
++                if (btm_known_no || !database.get_node_11v_capability(*station)) {
++                    LOG(DEBUG) << "Roaming candidate " << sta_mac_str
++                               << " does not support 11v, leaving it alone";
++                } else if (now >= next_check &&
++                           !m_task_pool.is_task_running(station->roaming_task_id)) {
++                    next_check = now + ROAMING_CANDIDATE_COOLDOWN;
++                    LOG(INFO) << "Roaming candidate " << sta_mac_str << " on " << bssid_info.bssid
++                              << ": RSSI "
++                              << int(son::wireless_utils::convert_rssi_from_rcpi(rcpi))
++                              << " dBm below threshold "
++                              << int(son::wireless_utils::convert_rssi_from_rcpi(threshold))
++                              << " dBm, evaluating";
++                    auto new_task = std::make_shared<optimal_path_task>(
++                        database, cmdu_tx, m_task_pool, sta_mac_str, 0, "roaming candidate");
++                    m_task_pool.add_task(new_task);
++                }
+             }
+         }
+         if (!database.dm_set_sta_link_metrics(sta_link_metric->sta_mac(),

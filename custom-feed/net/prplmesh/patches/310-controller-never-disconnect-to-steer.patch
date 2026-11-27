@@ -1,0 +1,124 @@
+From: prplmesh OpenWrt package
+Subject: [PATCH] controller: steer only with 802.11v, never disconnect
+
+Clients are only ever asked to move with an 802.11v BSS Transition
+request. The optimal path task no longer falls back to legacy steering
+(disassociate and block) for clients without 11v, and never sets
+"disassociation imminent", which made hostapd disassociate sticky
+clients when the timer expired. The steering task no longer blocks the
+client on the BSS it is connected to, so it can stay there if it
+declines. load_legacy_client_roaming defaults to 0.
+
+Also initialise Station::capabilities, which was read uninitialised by
+get_sta_current_capabilities() for stations whose capabilities were
+never set.
+
+--- a/controller/config/beerocks_controller.conf.in
++++ b/controller/config/beerocks_controller.conf.in
+@@ -13,7 +13,7 @@
+ ucc_listener_port=8002 # 0 - disabled
+ 
+ #   Client steering feature:
+-load_legacy_client_roaming=1
++load_legacy_client_roaming=0
+ 
+ #   Measurement feature:
+ load_backhaul_measurements=0
+--- a/controller/src/beerocks/master/db/station.h
++++ b/controller/src/beerocks/master/db/station.h
+@@ -158,7 +158,7 @@
+     };
+ 
+     std::shared_ptr<sta_stats_params> stats_info = std::make_shared<sta_stats_params>();
+-    beerocks::message::sRadioCapabilities *capabilities;
++    beerocks::message::sRadioCapabilities *capabilities = nullptr;
+     beerocks::message::sRadioCapabilities m_sta_6ghz_capabilities;
+     beerocks::message::sRadioCapabilities m_sta_5ghz_capabilities;
+     beerocks::message::sRadioCapabilities m_sta_24ghz_capabilities;
+--- a/controller/src/beerocks/master/tasks/optimal_path_task.cpp
++++ b/controller/src/beerocks/master/tasks/optimal_path_task.cpp
+@@ -1572,44 +1572,30 @@
+         state                = WAIT_FOR_HANDOVER;
+         int steering_task_id = 0;
+ 
+-        std::string method = " 11v (BTM) ";
+-        if (!database.get_node_11v_capability(*station)) {
+-            method = std::string(" Legacy ");
++        // Clients are only ever asked to move (802.11v BSS transition). One
++        // that doesn't support it is left alone: never disconnected or
++        // blocked to force it to another access point, and the request
++        // never carries "disassociation imminent" (hostapd would then
++        // disassociate it when the timer expires).
++        auto caps         = database.get_sta_current_capabilities(sta_mac);
++        bool btm_known_no = caps && caps->valid && !caps->btm_supported;
++        if (!database.get_node_11v_capability(*station) || btm_known_no) {
++            TASK_LOG(INFO) << "optimal_path_task: " << sta_mac
++                           << " does not support 11v, not steering it to " << chosen_bssid;
++            finish();
++            break;
+         }
+ 
++        std::string method = " 11v (BTM) ";
+         if (is_force_steer) {
+             chosen_method.append(" [forced steering] ");
+         }
+         chosen_method.append(" [optimal_path_task] ");
+-        if (database.get_node_11v_capability(*station) && !is_force_steer) {
+-            if (sticky_roaming_rssi <= database.config.roaming_sticky_client_rssi_threshold) {
+-                TASK_LOG(DEBUG) << "optimal_path_task: steering with disassociate imminent, sta "
+-                                << sta_mac << " steer from BSSID " << current_hostap_vap
+-                                << " to BSSID " << chosen_bssid;
+-                bool disassoc_imminent = true;
+-                method.append(" [with imminent] ");
+-                steering_task_id =
+-                    son_actions::steer_sta(database, cmdu_tx, tasks, sta_mac, chosen_bssid,
+-                                           chosen_method, method, disassoc_imminent);
+-            } else {
+-                TASK_LOG(DEBUG) << "optimal_path_task: steering without disassociate imminent, sta "
+-                                << sta_mac << " steer from BSSID " << current_hostap_vap
+-                                << " to BSSID " << chosen_bssid;
+-                bool disassoc_imminent = false;
+-                steering_task_id =
+-                    son_actions::steer_sta(database, cmdu_tx, tasks, sta_mac, chosen_bssid,
+-                                           chosen_method, method, disassoc_imminent);
+-            }
+-        } else if (database.settings_legacy_client_roaming()) {
+-            TASK_LOG(DEBUG) << "optimal_path_task: steering with disassociate imminent, sta "
+-                            << sta_mac << " steer from BSSID " << current_hostap_vap << " to BSSID "
+-                            << chosen_bssid;
+-            bool disassoc_imminent = true;
+-            method.append(" [imminent] ");
+-            steering_task_id =
+-                son_actions::steer_sta(database, cmdu_tx, tasks, sta_mac, chosen_bssid,
+-                                       chosen_method, method, disassoc_imminent);
+-        }
++        TASK_LOG(DEBUG) << "optimal_path_task: steering sta " << sta_mac << " from BSSID "
++                        << current_hostap_vap << " to BSSID " << chosen_bssid;
++        bool disassoc_imminent = false;
++        steering_task_id = son_actions::steer_sta(database, cmdu_tx, tasks, sta_mac, chosen_bssid,
++                                                  chosen_method, method, disassoc_imminent);
+ 
+         wait_for_task_end(steering_task_id, 30000);
+ 
+--- a/controller/src/beerocks/master/tasks/client_steering_task.cpp
++++ b/controller/src/beerocks/master/tasks/client_steering_task.cpp
+@@ -321,16 +321,10 @@
+              * Temporay fix: when steering station supporting 11v,
+              * do not disallow station on the original bss to let btm happen before deauth,
+              */
++            // Never block the client on the BSS it is connected to: if it
++            // declines the BSS transition request it must be able to stay.
+             if (tlvf::mac_to_string(bss.first) == m_original_bssid) {
+-
+-                /*
+-                 * consider BTM support in current station capabilities (when available)
+-                 * independently from updated 11v responsiveness
+-		         */
+-                auto cur_sta_cap = m_database.get_sta_current_capabilities(m_sta_mac);
+-                if (cur_sta_cap && cur_sta_cap->btm_supported) {
+-                    continue;
+-                }
++                continue;
+             }
+ 
+             // Send 17.1.27	Client Association Control Request : Block
