@@ -5,6 +5,14 @@
 'require ui';
 'require tools.prplmesh as pm';
 
+function capFlag(v) {
+	if (v === true)
+		return E('span', { 'style': 'color:green', 'title': _('Supported') }, '✓');
+	if (v === false)
+		return E('span', { 'style': 'color:#c00', 'title': _('Not supported') }, '✗');
+	return E('span', { 'title': _('Unknown') }, '?');
+}
+
 return view.extend({
 	load: function() {
 		return Promise.all([
@@ -48,6 +56,8 @@ return view.extend({
 							E('td', { 'class': 'td left' }, E('strong', node.gateway ? _('Router') : node.name)),
 							E('td', { 'class': 'td left' }, '%s (%s)'.format(vap.ssid, pm.bandOf(radio.freq))),
 							E('td', { 'class': 'td left' }, rssi ? '%d dBm'.format(rssi) : '-'),
+							E('td', { 'class': 'td center' }, capFlag(client.k11)),
+							E('td', { 'class': 'td center' }, capFlag(client.v11)),
 							E('td', { 'class': 'td left' }, E('div', {
 								'style': 'display:flex;flex-wrap:nowrap;align-items:center;gap:.5em'
 							}, [
@@ -74,6 +84,8 @@ return view.extend({
 					E('th', { 'class': 'th' }, _('Access point')),
 					E('th', { 'class': 'th' }, _('Network')),
 					E('th', { 'class': 'th' }, _('Signal')),
+					E('th', { 'class': 'th center', 'title': _('802.11k: the client can measure the other access points') }, '11k'),
+					E('th', { 'class': 'th center', 'title': _('802.11v: the client accepts a request to move to another access point') }, '11v'),
 					E('th', { 'class': 'th' }, _('Steer to'))
 				])
 			].concat(rows)) : E('p', { 'class': 'cbi-section-descr' },
