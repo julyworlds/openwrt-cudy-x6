@@ -1319,6 +1319,15 @@ define Device/dlink_dir-842-c3
 endef
 TARGET_DEVICES += dlink_dir-842-c3
 
+define Device/doodlelabs_smartradio
+  SOC := qca9533
+  DEVICE_VENDOR := Doodle Labs
+  DEVICE_MODEL := Smart Radio
+  SUPPORTED_DEVICES += smartradio
+  IMAGE_SIZE := 32000k
+endef
+TARGET_DEVICES += doodlelabs_smartradio
+
 define Device/dragino2_common
   SOC := ar9330
   DEVICE_VENDOR := Dragino
@@ -1698,6 +1707,23 @@ define Device/fortinet_fap-221-c
         gzip-filename $$$$(FACTORY_IMG_NAME)
 endef
 TARGET_DEVICES += fortinet_fap-221-c
+
+define Device/fortinet_fap-321-c
+  $(Device/senao_loader_okli)
+  SOC := qca9558
+  DEVICE_VENDOR := Fortinet
+  DEVICE_MODEL := FAP-321-C
+  FACTORY_IMG_NAME := FP321C-9.99-AP-build999-999999-patch99
+  DEVICE_PACKAGES := ath10k-firmware-qca988x-ct kmod-ath10k-ct
+  IMAGE_SIZE := 20480k
+  LOADER_FLASH_OFFS := 0x040000
+  IMAGE/factory.bin := append-kernel | pad-to $$$$(BLOCKSIZE) | \
+	append-rootfs | pad-rootfs | \
+	check-size | pad-to $$$$(IMAGE_SIZE) | \
+	append-loader-okli-uimage $(1) | pad-to 24576k | \
+	gzip-filename $$$$(FACTORY_IMG_NAME)
+endef
+TARGET_DEVICES += fortinet_fap-321-c
 
 define Device/glinet_6408
   $(Device/tplink-8mlzma)
