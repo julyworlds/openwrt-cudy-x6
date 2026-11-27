@@ -1,48 +1,91 @@
-# Local overlay of the prplmesh package from the "packages" feed.
+# prplMesh for the Cudy X6 firmware.
 #
-# Nothing upstream is copied: the upstream Makefile, files/ and patches/
-# are used as they are (only libopenssl is swapped for libmbedtls in
-# DEPENDS, see below), and the patches in ./patches are applied on top
-# of them. If an upstream update makes one of these patches stale, the
-# build stops in the patch step instead of silently dropping it.
+# Built from our prplMesh fork (branch "openwrt"): upstream release 6.2.0,
+# the patches of the OpenWrt packages feed and our own changes, all as git
+# commits. Changes to prplMesh go to the fork, never as patches here.
 #
-# For "./scripts/feeds install -a" to pick this package over the upstream
-# one, the "custom" feed must be listed before "packages" in feeds.conf
-# (or use: ./scripts/feeds install -p custom prplmesh).
-#
-# Helper symlinks this overlay relies on:
-#   files                           -> feeds/packages/net/prplmesh/files
-#   ../../lang/python/python3-*.mk  -> feeds/packages/lang/python/
-# (the upstream Makefile includes ../../lang/python/python3-host.mk
-# relative to the package directory)
+# Local development: point the package at a checkout of the fork with
+#   ln -s /path/to/prplMesh/.git custom-feed/net/prplmesh/git-src
+# and enable "Enable package source tree override" (CONFIG_SRC_TREE_OVERRIDE).
 
-PRPLMESH_UPSTREAM_DIR:=$(TOPDIR)/feeds/packages/net/prplmesh
-PRPLMESH_LOCAL_PATCH_DIR:=$(CURDIR)/patches
+include $(TOPDIR)/rules.mk
 
-ifeq ($(wildcard $(PRPLMESH_UPSTREAM_DIR)/Makefile),)
-  $(error prplmesh overlay: $(PRPLMESH_UPSTREAM_DIR)/Makefile not found, run ./scripts/feeds update packages)
-endif
+PKG_NAME:=prplmesh
+PKG_VERSION:=6.2.0
+PKG_RELEASE:=1
 
-# Upstream patches first (quilt.mk only sets PATCH_DIR if unset) ...
-PATCH_DIR:=$(PRPLMESH_UPSTREAM_DIR)/patches
+PKG_SOURCE_PROTO:=git
+PKG_SOURCE_URL:=https://github.com/julyworlds/prplMesh.git
+PKG_MIRROR_HASH:=df4a43306d326d32e4b73bcc399f5ad0328a68c2668eddcaeb9457cc560f1087
+PKG_SOURCE_DATE:=2026-11-28
+PKG_SOURCE_VERSION:=b67f4ed3c678854609a0e1414851c7c85ea531b9
+# The commit is part of the archive name so a new fork commit never reuses a
+# cached tarball of an older one.
+PKG_SOURCE:=$(PKG_NAME)-$(PKG_VERSION)-$(PKG_SOURCE_VERSION).tar.zst
+PKG_SOURCE_SUBDIR:=$(PKG_NAME)-$(PKG_VERSION)
 
-# ... then ours, as a prepare hook so they land after upstream's.
-define Prplmesh/LocalPatches
-	$(call PatchDir,$(PKG_BUILD_DIR),$(PRPLMESH_LOCAL_PATCH_DIR),local/)
+PKG_LICENSE:=BSD-2-Clause-Patent BSD-3-Clause ISC MIT
+PKG_LICENSE_FILES:=LICENSE LICENSES/BSD-3-Clause.txt LICENSES/ISC.txt LICENSES/MIT.txt
+
+# The tlvf code generator (framework/tlvf/tlvf.py) runs at build time and
+# needs a host Python with PyYAML
+PKG_BUILD_DEPENDS:=python3/host python-yaml/host
+CMAKE_BINARY_SUBDIR:=build-openwrt-stock
+
+include $(INCLUDE_DIR)/package.mk
+include $(INCLUDE_DIR)/cmake.mk
+include ../../lang/python/python3-host.mk
+
+define Package/prplmesh
+  SECTION:=net
+  CATEGORY:=Network
+  TITLE:=prplMesh EasyMesh controller and agent
+  URL:=https://github.com/julyworlds/prplMesh
+  DEPENDS:=+libstdcpp +libpthread +librt +libjson-c +libmbedtls +libnl-core +libnl-genl +libnl-route +libuci +libubus +libubox +getopt
 endef
-Hooks/Prepare/Post += Prplmesh/LocalPatches
 
-# Build for size (needs patches/190-cmake-optimize-for-size.patch).
-CMAKE_OPTIONS += -DPRPLMESH_OPTIMIZE_SIZE=ON
+define Package/prplmesh/description
+  prplMesh EasyMesh controller and agent built for stock OpenWrt. It talks
+  to the hostapd instances of the installed wpad over their UNIX control
+  sockets through a small bundled control-interface client; it does not
+  bundle, build or replace hostapd.
+endef
 
-# The upstream Makefile is read as is, with one change: libmbedtls instead
-# of libopenssl (needs patches/230-common-use-mbedtls-instead-of-openssl.patch).
-# If upstream changes that dependency, stop here instead of shipping a
-# package with a wrong dependency.
-PRPLMESH_UPSTREAM_MK:=$(file <$(PRPLMESH_UPSTREAM_DIR)/Makefile)
-ifeq ($(findstring +libopenssl ,$(PRPLMESH_UPSTREAM_MK)),)
-  $(error prplmesh overlay: upstream DEPENDS has no "+libopenssl" any more, review patches/230)
-endif
-$(eval $(subst +libopenssl ,+libmbedtls ,$(PRPLMESH_UPSTREAM_MK)))
+define Package/prplmesh/conffiles
+/etc/config/prplmesh
+endef
 
-# call BuildPackage - OpenWrt buildroot signature (BuildPackage is called by the upstream Makefile)
+CMAKE_OPTIONS += \
+	-DTARGET_PLATFORM=openwrt \
+	-DTARGET_PLATFORM_TYPE=stock \
+	-DBWL_TYPE=NL80211 \
+	-DBWL_BUNDLED_WPA_CTRL=ON \
+	-DENABLE_NBAPI=OFF \
+	-DUSE_PRPLMESH_WHM=OFF \
+	-DPRPLMESH_STOCK_OPENWRT_UCI=ON \
+	-DPRPLMESH_OPTIMIZE_SIZE=ON \
+	-DBUILD_AGENT=ON \
+	-DBUILD_CONTROLLER=ON \
+	-DBUILD_TESTS=OFF \
+	-DPRPLMESH_VERSION=$(PKG_VERSION) \
+	-DPRPLMESH_REVISION=openwrt-r$(PKG_RELEASE) \
+	-DBUILD_DATE=$(SOURCE_DATE_EPOCH) \
+	-DCMAKE_INSTALL_PREFIX=/usr/libexec/prplmesh \
+	-DPLATFORM_STAGING_DIR=$(STAGING_DIR) \
+	-DPLATFORM_INCLUDE_DIR=$(STAGING_DIR)/usr/include \
+	-DPython3_EXECUTABLE=$(HOST_PYTHON3_BIN)
+
+define Package/prplmesh/install
+	$(INSTALL_DIR) $(1)/usr/libexec/prplmesh/bin $(1)/usr/libexec/prplmesh/scripts $(1)/usr/share/prplmesh/config $(1)/usr/lib $(1)/etc/init.d $(1)/etc/config
+	$(INSTALL_BIN) $(PKG_INSTALL_DIR)/usr/libexec/prplmesh/bin/* $(1)/usr/libexec/prplmesh/bin/
+	$(INSTALL_BIN) $(PKG_INSTALL_DIR)/usr/libexec/prplmesh/scripts/prplmesh_utils.sh $(1)/usr/libexec/prplmesh/scripts/
+	$(INSTALL_DATA) $(PKG_INSTALL_DIR)/usr/libexec/prplmesh/share/* $(1)/usr/share/prplmesh/
+	$(INSTALL_DATA) $(PKG_INSTALL_DIR)/usr/libexec/prplmesh/config/* $(1)/usr/share/prplmesh/config/
+	$(LN) ../../share/prplmesh $(1)/usr/libexec/prplmesh/share
+	$(LN) ../../share/prplmesh/config $(1)/usr/libexec/prplmesh/config
+	$(CP) $(PKG_INSTALL_DIR)/usr/libexec/prplmesh/lib/*.so* $(1)/usr/lib/
+	$(INSTALL_BIN) ./files/prplmesh.init $(1)/etc/init.d/prplmesh
+	$(INSTALL_CONF) ./files/prplmesh.config $(1)/etc/config/prplmesh
+endef
+
+$(eval $(call BuildPackage,prplmesh))
