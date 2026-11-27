@@ -5,7 +5,8 @@ The controller only relied on agents sending AP Metrics Responses on
 their own (Metric Reporting Policy). Some third-party agents (seen with
 a TP-Link RE500X) only answer AP Metrics Queries, so the controller never
 got the link metrics of their associated stations. Send an AP Metrics
-Query for all BSSes of each agent at the link metrics interval.
+Query for all BSSes of each agent every 15 seconds, independently of the
+link metrics interval, so station RSSI stays fresh enough for roaming.
 
 --- a/controller/src/beerocks/master/tasks/link_metrics_task.cpp
 +++ b/controller/src/beerocks/master/tasks/link_metrics_task.cpp
@@ -17,41 +18,70 @@ Query for all BSSes of each agent at the link metrics interval.
  #include <tlvf/wfa_map/tlvUnassociatedStaLinkMetricsQuery.h>
  #include <tlvf/wfa_map/tlvUnassociatedStaLinkMetricsResponse.h>
  
-@@ -74,6 +75,37 @@
-             son_actions::send_cmdu_to_agent(agent->al_mac, cmdu_tx, database);
-         }
+@@ -31,8 +32,53 @@
+     last_query_request = std::chrono::steady_clock::now();
+ }
  
-+        // Ask every agent for its AP metrics too. Agents that report them
-+        // periodically (per the Metric Reporting Policy) are unaffected, but
-+        // some third-party agents only answer queries; without this the
-+        // controller never gets the RCPI of their associated stations.
-+        for (const auto &agent : database.get_all_connected_agents()) {
-+            std::vector<sMacAddr> bssids;
-+            for (const auto &radio : agent->radios) {
-+                for (const auto &bss : radio.second->bsses) {
-+                    if (bss.second && bss.second->bssid != beerocks::net::network_utils::ZERO_MAC) {
-+                        bssids.push_back(bss.second->bssid);
-+                    }
++// How often every agent is asked for its AP metrics (and so for the link
++// metrics of its associated stations). Independent of the link metrics
++// interval: roaming decisions need fresher station RSSI than that.
++static constexpr std::chrono::seconds AP_METRICS_QUERY_INTERVAL{15};
++
++void LinkMetricsTask::send_ap_metrics_queries()
++{
++    // Agents that report AP metrics periodically (Metric Reporting Policy)
++    // are unaffected, but some third-party agents (seen with a TP-Link
++    // RE500X) only answer queries; without this the controller never gets
++    // the RCPI of their associated stations.
++    for (const auto &agent : database.get_all_connected_agents()) {
++        std::vector<sMacAddr> bssids;
++        for (const auto &radio : agent->radios) {
++            for (const auto &bss : radio.second->bsses) {
++                if (bss.second && bss.second->bssid != beerocks::net::network_utils::ZERO_MAC) {
++                    bssids.push_back(bss.second->bssid);
 +                }
 +            }
-+            if (bssids.empty()) {
-+                continue;
-+            }
-+            if (!cmdu_tx.create(0, ieee1905_1::eMessageType::AP_METRICS_QUERY_MESSAGE)) {
-+                LOG(ERROR) << "Failed building AP_METRICS_QUERY_MESSAGE!";
-+                break;
-+            }
-+            auto query = cmdu_tx.addClass<wfa_map::tlvApMetricQuery>();
-+            if (!query || !query->alloc_bssid_list(bssids.size())) {
-+                LOG(ERROR) << "Failed building tlvApMetricQuery";
-+                break;
-+            }
-+            for (size_t i = 0; i < bssids.size(); i++) {
-+                std::get<1>(query->bssid_list(i)) = bssids[i];
-+            }
-+            son_actions::send_cmdu_to_agent(agent->al_mac, cmdu_tx, database);
 +        }
++        if (bssids.empty()) {
++            continue;
++        }
++        if (!cmdu_tx.create(0, ieee1905_1::eMessageType::AP_METRICS_QUERY_MESSAGE)) {
++            LOG(ERROR) << "Failed building AP_METRICS_QUERY_MESSAGE!";
++            return;
++        }
++        auto query = cmdu_tx.addClass<wfa_map::tlvApMetricQuery>();
++        if (!query || !query->alloc_bssid_list(bssids.size())) {
++            LOG(ERROR) << "Failed building tlvApMetricQuery";
++            return;
++        }
++        for (size_t i = 0; i < bssids.size(); i++) {
++            std::get<1>(query->bssid_list(i)) = bssids[i];
++        }
++        son_actions::send_cmdu_to_agent(agent->al_mac, cmdu_tx, database);
++    }
++}
 +
-         last_query_request = std::chrono::steady_clock::now();
-     }
-     return;
+ void LinkMetricsTask::work()
+ {
++    auto now_ap = std::chrono::steady_clock::now();
++    if (now_ap - last_ap_metrics_query >= AP_METRICS_QUERY_INTERVAL) {
++        last_ap_metrics_query = now_ap;
++        send_ap_metrics_queries();
++    }
++
+ 
+     // Zero setting means do not sent any periodic request.
+     if (database.config.link_metrics_request_interval_seconds == std::chrono::seconds::zero()) {
+--- a/controller/src/beerocks/master/tasks/link_metrics_task.h
++++ b/controller/src/beerocks/master/tasks/link_metrics_task.h
+@@ -84,6 +84,10 @@
+     ieee1905_1::CmduMessageTx &cert_cmdu_tx;
+     task_pool &tasks;
+     std::chrono::steady_clock::time_point last_query_request{};
++    std::chrono::steady_clock::time_point last_ap_metrics_query{};
++
++    /** @brief Send an AP Metrics Query for all BSSes of every connected agent. */
++    void send_ap_metrics_queries();
+ 
+     /**
+      * @brief Prints all link metric and its sub parameters according to supplied map.

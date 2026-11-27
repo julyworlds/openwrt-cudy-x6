@@ -1,0 +1,213 @@
+From: prplmesh OpenWrt package
+Subject: [PATCH] controller: roaming threshold from the mesh links
+
+Derive the STA RCPI reporting threshold of the Metric Reporting Policy
+per agent and radio from the mesh itself: the RSSI at which the agent
+hears its nearest mesh neighbour (wireless backhaul link) plus 4 dB,
+adjusted by roaming_band_pathloss_delta_db when the radio and the link
+are on different bands, clamped to -80..-55 dBm. A client below it is
+about as far away as the other agent and is logged as a roaming
+candidate, whether the RCPI came from an agent-initiated report or from
+the periodic AP metrics. The threshold is recomputed every 15 seconds
+and the policy resent when it moves by 3 dB or more. The configured
+sta_reporting_rcpi_threshold is only used when there is no wireless mesh
+link to derive it from.
+
+--- a/controller/src/beerocks/master/tasks/agent_monitoring_task.cpp
++++ b/controller/src/beerocks/master/tasks/agent_monitoring_task.cpp
+@@ -28,7 +28,9 @@
+ #include <tlvf/wfa_map/tlvQoSManagementPolicy.h>
+ #include <tlvf/wfa_map/tlvSteeringPolicy.h>
+ 
++#include <algorithm>
+ #include <cstdint>
++#include <cstdlib>
+ #include <limits>
+ #include <set>
+ #include <string>
+@@ -274,8 +276,128 @@
+ {
+ }
+ 
++namespace {
++
++// A client becomes a roaming candidate once its uplink RSSI drops below the
++// RSSI at which its agent hears its nearest mesh neighbour plus this margin:
++// it is then about as far away as the other agent, which may serve it better.
++constexpr int MESH_ROAMING_MARGIN_DB          = 4;
++constexpr int MESH_ROAMING_THRESHOLD_MIN_DBM  = -80;
++constexpr int MESH_ROAMING_THRESHOLD_MAX_DBM  = -55;
++constexpr auto MESH_ROAMING_THRESHOLD_PERIOD  = std::chrono::seconds(15);
++// Resend the policy only when the threshold moved at least this much (RCPI
++// units, 0.5 dB each) so link RSSI jitter doesn't cause policy churn.
++constexpr int MESH_ROAMING_THRESHOLD_HYST_RCPI = 6;
++
++/**
++ * Strongest wireless mesh link of an agent, as RSSI (dBm) and band.
++ *
++ * The stations connected to a backhaul BSS are the backhaul stations of
++ * other agents, and the RSSI the parent measures for them is the RSSI of
++ * that mesh link. It counts for the parent and for the agent owning the
++ * backhaul station (found by its interfaces, or as a child of the parent).
++ * This doesn't rely on agent->backhaul, which is inferred as wired for
++ * extenders whose WDS link shows up as a bridged LAN neighbour.
++ */
++bool strongest_mesh_link(db &database, const Agent &agent, int &rssi, beerocks::eFreqType &band)
++{
++    bool found = false;
++
++    for (const auto &parent : database.get_all_connected_agents()) {
++        if (!parent) {
++            continue;
++        }
++        for (const auto &radio : parent->radios) {
++            for (const auto &bss : radio.second->bsses) {
++                if (!bss.second || !bss.second->backhaul) {
++                    continue;
++                }
++                for (const auto &sta_entry : bss.second->connected_stations) {
++                    const auto &sta = sta_entry.second;
++                    if (!sta || !sta->stats_info ||
++                        sta->stats_info->rx_rssi == beerocks::RSSI_INVALID) {
++                        continue;
++                    }
++
++                    bool involved = parent.get() == &agent;
++                    if (!involved) {
++                        involved = agent.interfaces.find(sta_entry.first) != agent.interfaces.end() ||
++                                   agent.backhaul.backhaul_interface == sta_entry.first ||
++                                   agent.backhaul.parent_agent.lock() == parent;
++                    }
++                    if (!involved) {
++                        continue;
++                    }
++
++                    int link_rssi = sta->stats_info->rx_rssi;
++                    if (!found || link_rssi > rssi) {
++                        rssi  = link_rssi;
++                        band  = radio.second->get_band();
++                        found = true;
++                    }
++                }
++            }
++        }
++    }
++    return found;
++}
++
++/** RCPI threshold for the Metric Reporting Policy of a radio, 0 if unknown. */
++uint8_t mesh_rcpi_threshold(db &database, const Agent &agent, const Agent::sRadio &radio)
++{
++    int link_rssi;
++    beerocks::eFreqType link_band;
++    if (!strongest_mesh_link(database, agent, link_rssi, link_band)) {
++        return 0;
++    }
++
++    int threshold     = link_rssi + MESH_ROAMING_MARGIN_DB;
++    bool radio_is_24g = radio.get_band() == beerocks::FREQ_24G;
++    bool link_is_24g  = link_band == beerocks::FREQ_24G;
++    // 2.4 GHz loses less signal over the same distance.
++    if (radio_is_24g && !link_is_24g) {
++        threshold += database.config.roaming_band_pathloss_delta_db;
++    } else if (!radio_is_24g && link_is_24g) {
++        threshold -= database.config.roaming_band_pathloss_delta_db;
++    }
++    threshold = std::max(MESH_ROAMING_THRESHOLD_MIN_DBM,
++                         std::min(MESH_ROAMING_THRESHOLD_MAX_DBM, threshold));
++
++    return static_cast<uint8_t>((threshold + 110) * 2);
++}
++
++} // namespace
++
++void agent_monitoring_task::update_mesh_rcpi_thresholds()
++{
++    for (const auto &agent : database.get_all_connected_agents()) {
++        if (!agent) {
++            continue;
++        }
++        for (const auto &radio : agent->radios) {
++            int wanted  = mesh_rcpi_threshold(database, *agent, *radio.second);
++            int current = radio.second->metric_reporting_policies.sta_reporting_rcpi_threshold;
++            if (!wanted || std::abs(wanted - current) < MESH_ROAMING_THRESHOLD_HYST_RCPI) {
++                continue;
++            }
++            LOG(INFO) << "Roaming threshold of agent " << agent->al_mac << " changes ("
++                      << "RCPI " << current << " -> " << wanted << "), sending policy";
++            if (!send_multi_ap_policy_config_request(agent->al_mac, cmdu_tx)) {
++                LOG(ERROR) << "Failed to send Metric Reporting Policy to " << agent->al_mac;
++            }
++            break; // the policy covers all radios of the agent
++        }
++    }
++}
++
+ void agent_monitoring_task::work()
+ {
++    auto now_thr = std::chrono::steady_clock::now();
++    if (now_thr >= m_next_rcpi_threshold_update) {
++        m_next_rcpi_threshold_update = now_thr + MESH_ROAMING_THRESHOLD_PERIOD;
++        update_mesh_rcpi_thresholds();
++    }
++
+     if (!m_ap_autoconfig_renew_sent) {
+         /**
+          * Usually, the ap-configuration sequence is started when the agent sends the ap-config
+@@ -761,9 +883,18 @@
+             radio.second->metric_reporting_policies.assoc_wifi6_sta_status_report_inclusion_policy =
+                 database.config.assoc_wifi6_sta_status_report_inclusion_policy;
+ 
++        // Roaming threshold derived from the mesh links; the configured
++        // value only when it can't be derived (no wireless mesh link yet).
++        uint8_t rcpi_threshold = mesh_rcpi_threshold(database, *agent, *radio.second);
++        if (!rcpi_threshold) {
++            rcpi_threshold = database.config.sta_reporting_rcpi_threshold;
++        }
++        LOG(INFO) << "STA RCPI reporting threshold for radio " << radio.second->radio_uid << ": "
++                  << int(rcpi_threshold)
++                  << (rcpi_threshold ? " (" + std::to_string(rcpi_threshold / 2 - 110) + " dBm)"
++                                     : std::string(" (disabled)"));
+         reporting_conf.sta_metrics_reporting_rcpi_threshold =
+-            radio.second->metric_reporting_policies.sta_reporting_rcpi_threshold =
+-                database.config.sta_reporting_rcpi_threshold;
++            radio.second->metric_reporting_policies.sta_reporting_rcpi_threshold = rcpi_threshold;
+         reporting_conf.sta_metrics_reporting_rcpi_hysteresis_margin_override =
+             radio.second->metric_reporting_policies
+                 .sta_reporting_rcpi_hyst_margin_override_threshold =
+--- a/controller/src/beerocks/master/tasks/agent_monitoring_task.h
++++ b/controller/src/beerocks/master/tasks/agent_monitoring_task.h
+@@ -72,6 +72,10 @@
+     ieee1905_1::CmduMessageTx &cmdu_tx;
+     task_pool &tasks;
+ 
++    /** @brief Resend the Metric Reporting Policy where the roaming threshold derived from the mesh links changed. */
++    void update_mesh_rcpi_thresholds();
++    std::chrono::steady_clock::time_point m_next_rcpi_threshold_update{};
++
+     struct sBssStats {
+         uint32_t unicast_bytes_sent;
+         uint32_t unicast_bytes_received;
+--- a/controller/src/beerocks/master/controller.cpp
++++ b/controller/src/beerocks/master/controller.cpp
+@@ -2463,6 +2463,20 @@
+             station->stats_info->rx_rssi   = son::wireless_utils::convert_rssi_from_rcpi(rcpi);
+             station->stats_info->timestamp = std::chrono::steady_clock::now();
+         }
++
++        // Below the roaming threshold of its radio (see the Metric Reporting
++        // Policy): the station may be better served by another agent.
++        auto radio = database.get_radio_by_bssid(bssid_info.bssid);
++        if (station && !station->is_bSta() && radio && rcpi > 0 && rcpi <= beerocks::RCPI_MAX) {
++            auto threshold = radio->metric_reporting_policies.sta_reporting_rcpi_threshold;
++            if (threshold && rcpi < threshold) {
++                LOG(INFO) << "Roaming candidate " << sta_link_metric->sta_mac() << " on "
++                          << bssid_info.bssid << ": RSSI "
++                          << int(son::wireless_utils::convert_rssi_from_rcpi(rcpi))
++                          << " dBm below threshold "
++                          << int(son::wireless_utils::convert_rssi_from_rcpi(threshold)) << " dBm";
++            }
++        }
+         if (!database.dm_set_sta_link_metrics(sta_link_metric->sta_mac(),
+                                               bssid_info.downlink_estimated_mac_data_rate_mbps,
+                                               bssid_info.uplink_estimated_mac_data_rate_mbps,
