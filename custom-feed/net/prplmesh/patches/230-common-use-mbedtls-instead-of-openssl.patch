@@ -1,0 +1,832 @@
+From: prplmesh OpenWrt package
+Subject: [PATCH] common: use mbed TLS instead of OpenSSL
+
+prplMesh only needs DH (RFC 3526 group 5), SHA-256, HMAC-SHA256 and
+AES-128-CBC for the WSC M1/M2 exchange. Implement them with mbed TLS
+(libmbedcrypto), which OpenWrt images usually ship anyway, so the
+much larger libopenssl is not needed.
+
+The DH shared secret is now always zero padded to the size of the
+prime (192 bytes), as the WSC spec requires for the DHKey (hostapd does
+the same). Before, a secret with leading zero bytes was hashed
+unpadded and the derived keys did not match the peer.
+
+OpenSSL types are no longer exposed by mapf/common/encryption.h.
+---
+diff --color -ru a/framework/common/CMakeLists.txt b/framework/common/CMakeLists.txt
+--- a/framework/common/CMakeLists.txt
++++ b/framework/common/CMakeLists.txt
+@@ -9,11 +9,9 @@
+ # mapfcommon sources
+ set(sources logger.cpp encryption.cpp utils.cpp hmac_wrapper.cpp)
+ 
+-# We use OpenSSL >=3.0.0 for data encryption
+-find_package(OpenSSL 3.0 QUIET)
+-if(NOT OpenSSL_FOUND)
+-	find_package(OpenSSL 1.1 REQUIRED)
+-endif()
++# mbed TLS (libmbedcrypto) is used for data encryption
++find_path(MBEDTLS_INCLUDE_DIR mbedtls/aes.h REQUIRED)
++find_library(MBEDCRYPTO_LIBRARY mbedcrypto REQUIRED)
+ 
+ # Create a single common library
+ add_library(mapfcommon ${sources})
+@@ -22,13 +20,13 @@
+ 	PRIVATE 
+ 		elpp
+ 		json-c 
+-	PUBLIC
+-		${OPENSSL_LIBRARIES}
++		${MBEDCRYPTO_LIBRARY}
+ )
+ target_include_directories(mapfcommon
+ 	PUBLIC 
+ 		${PLATFORM_INCLUDE_DIR}
+-		${OPENSSL_INCLUDE_DIR}
++	PRIVATE
++		${MBEDTLS_INCLUDE_DIR}
+ )
+ 
+ configure_file(
+diff --color -ru a/framework/common/encryption.cpp b/framework/common/encryption.cpp
+--- a/framework/common/encryption.cpp
++++ b/framework/common/encryption.cpp
+@@ -74,6 +74,11 @@
+ 
+ #include "hmac_wrapper.h"
+ 
++#include <mbedtls/aes.h>
++#include <mbedtls/bignum.h>
++#include <mbedtls/platform_util.h>
++#include <mbedtls/sha256.h>
++
+ namespace mapf {
+ namespace encryption {
+ 
+@@ -104,313 +109,148 @@
+ 
+ const uint8_t diffie_hellman::dh1536_g[] = {0x02};
+ 
+-#if OPENSSL_VERSION_NUMBER < 0x30000000L
+-diffie_hellman::diffie_hellman() : m_dh(nullptr), m_pubkey(nullptr)
++/* RAII helper for mbedtls_mpi */
++namespace {
++struct mpi {
++    mbedtls_mpi v;
++    mpi() { mbedtls_mpi_init(&v); }
++    ~mpi() { mbedtls_mpi_free(&v); }
++    mpi(const mpi &) = delete;
++    mpi &operator=(const mpi &) = delete;
++    mbedtls_mpi *operator&() { return &v; }
++};
++} // namespace
++
++diffie_hellman::diffie_hellman() : m_pubkey(nullptr)
+ {
+     MAPF_DBG("Generating DH keypair");
+ 
+-    m_dh = DH_new();
+-    if (!m_dh) {
+-        MAPF_ERR("Failed to allocate DH");
+-        return;
+-    }
++    mpi p, g, x, y;
+ 
+-    if (!generate_random_bytestream(m_nonce, sizeof(m_nonce))) {
+-        MAPF_ERR("Failed to generate nonce");
++    if (mbedtls_mpi_read_binary(&p, dh1536_p, sizeof(dh1536_p)) != 0 ||
++        mbedtls_mpi_read_binary(&g, dh1536_g, sizeof(dh1536_g)) != 0) {
++        MAPF_ERR("Failed to set DH p and g");
+         return;
+     }
+ 
+-    // Convert binary to BIGNUM format
+-    if (0 == DH_set0_pqg(m_dh, BN_bin2bn(dh1536_p, sizeof(dh1536_p), nullptr), NULL,
+-                         BN_bin2bn(dh1536_g, sizeof(dh1536_g), nullptr))) {
+-        MAPF_ERR("Failed to set DH pqg");
+-        return;
+-    }
++    // Private exponent: random, 1 < x < p - 1 (top bit cleared so x < p)
++    do {
++        if (!generate_random_bytestream(m_privkey, sizeof(m_privkey))) {
++            MAPF_ERR("Failed to generate DH private key");
++            return;
++        }
++        m_privkey[0] &= 0x7f;
++        if (mbedtls_mpi_read_binary(&x, m_privkey, sizeof(m_privkey)) != 0) {
++            MAPF_ERR("Failed to read DH private key");
++            return;
++        }
++    } while (mbedtls_mpi_cmp_int(&x, 1) <= 0);
+ 
+-    // Obtain key pair
+-    if (0 == DH_generate_key(m_dh)) {
++    // Public key: y = g^x mod p
++    if (mbedtls_mpi_exp_mod(&y, &g, &x, &p, nullptr) != 0) {
+         MAPF_ERR("Failed to generate DH key");
+         return;
+     }
+ 
+-    const BIGNUM *pub_key;
+-    DH_get0_key(m_dh, &pub_key, nullptr);
+-
+-    m_pubkey_length = BN_num_bytes(pub_key);
+-    m_pubkey        = new uint8_t[m_pubkey_length];
+-    BN_bn2bin(pub_key, m_pubkey);
+-}
+-
+-diffie_hellman::~diffie_hellman()
+-{
+-    delete[] m_pubkey;
+-    DH_free(m_dh);
+-}
+-
+-bool diffie_hellman::compute_key(uint8_t *key, size_t &key_length, const uint8_t *remote_pubkey,
+-                                 size_t remote_pubkey_length) const
+-{
+-    if (!m_pubkey) {
+-        return false;
+-    }
+-
+-    MAPF_DBG("Computing DH shared key");
+-
+-    BIGNUM *pub_key = BN_bin2bn(remote_pubkey, remote_pubkey_length, NULL);
+-    if (!pub_key) {
+-        MAPF_ERR("Failed to set DH remote_pub_key");
+-        return 0;
+-    }
+-
+-    // Compute the shared secret and save it in the output buffer
+-    if ((int)key_length < DH_size(m_dh)) {
+-        MAPF_ERR("Output buffer for DH shared key to small: ")
+-            << key_length << " < " << DH_size(m_dh);
+-        BN_clear_free(pub_key);
+-        return false;
+-    }
+-    int ret = DH_compute_key(key, pub_key, m_dh);
+-    BN_clear_free(pub_key);
+-    if (ret < 0) {
+-        MAPF_ERR("Failed to compute DH shared key");
+-        return false;
+-    }
+-    key_length = (size_t)ret;
+-    return true;
+-}
+-#else
+-diffie_hellman::diffie_hellman() : m_evp(nullptr), m_pubkey(nullptr)
+-{
+-    MAPF_DBG("Generating EVP keypair");
+-
+-    std::unique_ptr<BIGNUM, decltype(&BN_free)> p(BN_bin2bn(dh1536_p, sizeof(dh1536_p), nullptr),
+-                                                  &BN_free);
+-    std::unique_ptr<BIGNUM, decltype(&BN_free)> g(BN_bin2bn(dh1536_g, sizeof(dh1536_g), nullptr),
+-                                                  &BN_free);
+-
+-    // Create the OSSL_PARAM_BLD
+-    std::unique_ptr<OSSL_PARAM_BLD, decltype(&OSSL_PARAM_BLD_free)> paramBuild(
+-        OSSL_PARAM_BLD_new(), &OSSL_PARAM_BLD_free);
+-    if (!paramBuild.get()) {
+-        MAPF_ERR("Failed to create a new OSSL_PARAM_BLD");
+-        return;
+-    }
+-
+-    // Set the prime and generator
+-    if (!OSSL_PARAM_BLD_push_BN(paramBuild.get(), OSSL_PKEY_PARAM_FFC_P, p.get()) ||
+-        !OSSL_PARAM_BLD_push_BN(paramBuild.get(), OSSL_PKEY_PARAM_FFC_G, g.get())) {
+-        MAPF_ERR("Failed to set prime and generator in OSSL_PARAM_BLD");
+-        return;
+-    }
+-
+-    // Convert to OSSL_PARAM
+-    std::unique_ptr<OSSL_PARAM, decltype(&OSSL_PARAM_free)> param(
+-        OSSL_PARAM_BLD_to_param(paramBuild.get()), &OSSL_PARAM_free);
+-    if (!param.get()) {
+-        MAPF_ERR("Failed to convert OSSL_PARAM_BLD to OSSL_PARAM");
+-        return;
+-    }
+-
+-    // Create the key context
+-    std::unique_ptr<EVP_PKEY_CTX, decltype(&EVP_PKEY_CTX_free)> keyCtx(
+-        EVP_PKEY_CTX_new_from_name(nullptr, "DHX", nullptr), &EVP_PKEY_CTX_free);
+-    if (!keyCtx.get()) {
+-        MAPF_ERR("Failed to create EVP_PKEY context");
+-        return;
+-    }
+-
+-    // Initialize the context.
+-    if (EVP_PKEY_fromdata_init(keyCtx.get()) <= 0) {
+-        MAPF_ERR("Failed to initialize EVP_PKEY context");
+-        return;
+-    }
+-    // Create the domain parameter key.
+-    EVP_PKEY *domainParamKey = nullptr;
+-    if (EVP_PKEY_fromdata(keyCtx.get(), &domainParamKey, EVP_PKEY_KEY_PARAMETERS, param.get()) <=
+-        0) {
+-        MAPF_ERR("Failed to create EVP_PKEY");
+-        return;
+-    }
+-
+-    // Create keypair
+-    std::unique_ptr<EVP_PKEY_CTX, decltype(&EVP_PKEY_CTX_free)> keyGenerationCtx(
+-        EVP_PKEY_CTX_new_from_pkey(nullptr, domainParamKey, nullptr), &EVP_PKEY_CTX_free);
+-    if (!keyGenerationCtx.get()) {
+-        MAPF_ERR("Failed to create keyGeneration context");
+-        return;
+-    }
+-    if (EVP_PKEY_keygen_init(keyGenerationCtx.get()) <= 0) {
+-        MAPF_ERR("Failed to initialize key generation");
+-        return;
+-    }
+-    if (EVP_PKEY_generate(keyGenerationCtx.get(), &m_evp) <= 0) {
+-        MAPF_ERR("Failed to generate DH key pair");
+-        return;
+-    }
+-
+-    BIGNUM *pub_key = nullptr;
+-    if (EVP_PKEY_get_bn_param(m_evp, OSSL_PKEY_PARAM_PUB_KEY, &pub_key) != 1) {
+-        MAPF_ERR("Failed to get the public key");
++    if (!generate_random_bytestream(m_nonce, sizeof(m_nonce))) {
++        MAPF_ERR("Failed to generate nonce");
+         return;
+     }
+ 
+-    m_pubkey_length = BN_num_bytes(pub_key);
++    m_pubkey_length = mbedtls_mpi_size(&y);
+     m_pubkey        = new uint8_t[m_pubkey_length];
+-    if (0 == BN_bn2bin(pub_key, m_pubkey)) {
++    if (mbedtls_mpi_write_binary(&y, m_pubkey, m_pubkey_length) != 0) {
+         MAPF_ERR("Failed to convert public key");
++        delete[] m_pubkey;
++        m_pubkey = nullptr;
+         return;
+     }
+-    BN_free(pub_key);
+ 
+-    if (RAND_bytes(m_nonce, sizeof(m_nonce)) != 1) {
+-        MAPF_ERR("Failed to generate nonce");
+-        return;
+-    }
+-
+-    MAPF_INFO("EVP keypair generated");
++    MAPF_INFO("DH keypair generated");
+ }
+ 
+ diffie_hellman::~diffie_hellman()
+ {
+     delete[] m_pubkey;
+-    if (m_evp != nullptr) {
+-        EVP_PKEY_free(m_evp);
+-    }
+-}
+-
+-bool diffie_hellman::create_peer_EVPKey(
+-    const uint8_t *remote_pubkey, size_t remote_pubkey_length,
+-    std::unique_ptr<EVP_PKEY, decltype(&EVP_PKEY_free)> *peerPubKey) const
+-{
+-
+-    std::unique_ptr<BIGNUM, decltype(&BN_free)> p(BN_bin2bn(dh1536_p, sizeof(dh1536_p), nullptr),
+-                                                  &BN_free);
+-    std::unique_ptr<BIGNUM, decltype(&BN_free)> g(BN_bin2bn(dh1536_g, sizeof(dh1536_g), nullptr),
+-                                                  &BN_free);
+-
+-    std::unique_ptr<BIGNUM, decltype(&BN_clear_free)> bigNumPeerPublicKey(
+-        BN_bin2bn(remote_pubkey, remote_pubkey_length, nullptr), &BN_clear_free);
+-    if (!bigNumPeerPublicKey.get()) {
+-        MAPF_ERR("Failed to convert remote_pubkey to bignum");
+-        return false;
+-    }
+-
+-    // Create the OSSL_PARAM_BLD.
+-    std::unique_ptr<OSSL_PARAM_BLD, decltype(&OSSL_PARAM_BLD_free)> paramBuild{
+-        OSSL_PARAM_BLD_new(), &OSSL_PARAM_BLD_free};
+-    if (!paramBuild.get()) {
+-        MAPF_ERR("Failed to allocate OSSL_PARAM builder");
+-        return false;
+-    }
+-
+-    // Set public key, prime and generator
+-    if (!OSSL_PARAM_BLD_push_BN(paramBuild.get(), OSSL_PKEY_PARAM_PUB_KEY,
+-                                bigNumPeerPublicKey.get())) {
+-        MAPF_ERR("Failed to set public key to OSSL_PARAM builder");
+-        return false;
+-    }
+-    if (!OSSL_PARAM_BLD_push_BN(paramBuild.get(), OSSL_PKEY_PARAM_FFC_P, p.get()) ||
+-        !OSSL_PARAM_BLD_push_BN(paramBuild.get(), OSSL_PKEY_PARAM_FFC_G, g.get())) {
+-        MAPF_ERR("Failed to set p or g value in OSSL_PARAM builder");
+-        return false;
+-    }
+-
+-    std::unique_ptr<OSSL_PARAM, decltype(&OSSL_PARAM_free)> param{
+-        OSSL_PARAM_BLD_to_param(paramBuild.get()), &OSSL_PARAM_free};
+-    if (!param.get()) {
+-        MAPF_ERR("Failed to create public key, OSSL_PARAM generation failed");
+-        return false;
+-    }
+-
+-    std::unique_ptr<EVP_PKEY_CTX, decltype(&EVP_PKEY_CTX_free)> peerPublicKeyCtx{
+-        EVP_PKEY_CTX_new_from_name(nullptr, "DHX", nullptr), &EVP_PKEY_CTX_free};
+-    if (!peerPublicKeyCtx.get()) {
+-        MAPF_ERR("Failed to create public key, EVP_PKEY context generation failed");
+-        return false;
+-    }
+-
+-    if (EVP_PKEY_fromdata_init(peerPublicKeyCtx.get()) <= 0) {
+-        MAPF_ERR("Failed to create public key, EVP_PKEY_fromdata_init failed");
+-        return false;
+-    }
+-
+-    EVP_PKEY *tmp = nullptr;
+-    if (EVP_PKEY_fromdata(peerPublicKeyCtx.get(), &tmp, EVP_PKEY_PUBLIC_KEY, param.get()) <= 0) {
+-        MAPF_ERR("Failed to create public key, EVP_PKEY_fromdata failed");
+-        return false;
+-    }
+-
+-    peerPubKey->reset(tmp);
+-
+-    return true;
++    mbedtls_platform_zeroize(m_privkey, sizeof(m_privkey));
+ }
+ 
+ bool diffie_hellman::compute_key(uint8_t *key, size_t &key_length, const uint8_t *remote_pubkey,
+                                  size_t remote_pubkey_length) const
+ {
++    if (!m_pubkey) {
++        return false;
++    }
+ 
+     MAPF_DBG("Computing DH shared key");
+ 
+-    // Create remote EVP key from remote_pubkey
+-    std::unique_ptr<EVP_PKEY, decltype(&EVP_PKEY_free)> remoteEVPKey(EVP_PKEY_new(),
+-                                                                     &EVP_PKEY_free);
+-    if (!create_peer_EVPKey(remote_pubkey, remote_pubkey_length, &remoteEVPKey)) {
+-        MAPF_ERR("Failed to create public EVP key");
++    if (key_length < sizeof(dh1536_p)) {
++        MAPF_ERR("Output buffer for DH shared key to small: ")
++            << key_length << " < " << sizeof(dh1536_p);
+         return false;
+     }
+ 
+-    std::unique_ptr<EVP_PKEY_CTX, decltype(&EVP_PKEY_CTX_free)> derivationCtx(
+-        EVP_PKEY_CTX_new(m_evp, nullptr), &EVP_PKEY_CTX_free);
+-    if (!derivationCtx) {
+-        MAPF_ERR("Failed to allocate key derivation context");
+-        return false;
+-    }
++    mpi p, x, y, p_minus_1, k;
+ 
+-    if (EVP_PKEY_derive_init(derivationCtx.get()) <= 0) {
+-        MAPF_ERR("Failed to initialize key derivation context");
++    if (mbedtls_mpi_read_binary(&p, dh1536_p, sizeof(dh1536_p)) != 0 ||
++        mbedtls_mpi_read_binary(&x, m_privkey, sizeof(m_privkey)) != 0 ||
++        mbedtls_mpi_read_binary(&y, remote_pubkey, remote_pubkey_length) != 0 ||
++        mbedtls_mpi_sub_int(&p_minus_1, &p, 1) != 0) {
++        MAPF_ERR("Failed to set DH remote_pub_key");
+         return false;
+     }
+ 
+-    if (EVP_PKEY_derive_set_peer(derivationCtx.get(), remoteEVPKey.get()) <= 0) {
+-        MAPF_ERR("Failed to set public key in EVP context");
++    // Reject degenerate peer keys: 1 < y < p - 1
++    if (mbedtls_mpi_cmp_int(&y, 1) <= 0 || mbedtls_mpi_cmp_mpi(&y, &p_minus_1) >= 0) {
++        MAPF_ERR("Invalid DH remote_pub_key");
+         return false;
+     }
+ 
+-    if (EVP_PKEY_derive(derivationCtx.get(), key, &key_length) <= 0) {
+-        MAPF_ERR("Failed to derrive shared key");
++    if (mbedtls_mpi_exp_mod(&k, &y, &x, &p, nullptr) != 0) {
++        MAPF_ERR("Failed to compute DH shared key");
+         return false;
+     }
+-    if (key_length == 0) {
+-        MAPF_ERR("Failed to compute DH shared key, keylength is zero");
++
++    // Zero padded to the size of p, as required by WSC for the DHKey
++    key_length = sizeof(dh1536_p);
++    if (mbedtls_mpi_write_binary(&k, key, key_length) != 0) {
++        MAPF_ERR("Failed to compute DH shared key");
+         return false;
+     }
+ 
+     return true;
+ }
+-#endif
+ 
+ bool create_iv(uint8_t *iv, unsigned iv_length)
+ {
+     return generate_random_bytestream(iv, iv_length);
+ }
+ 
+-sha256::sha256() : m_ctx(EVP_MD_CTX_new())
++sha256::sha256() : m_ctx(new mbedtls_sha256_context)
+ {
+-    if (!EVP_DigestInit_ex(m_ctx, EVP_sha256(), NULL)) {
++    mbedtls_sha256_init(m_ctx);
++    if (mbedtls_sha256_starts(m_ctx, 0) != 0) {
+         MAPF_ERR("Failed to create sha256");
+-        EVP_MD_CTX_free(m_ctx);
++        mbedtls_sha256_free(m_ctx);
++        delete m_ctx;
+         m_ctx = nullptr;
+     }
+ }
+ 
+-sha256::~sha256() { EVP_MD_CTX_free(m_ctx); }
++sha256::~sha256()
++{
++    if (m_ctx) {
++        mbedtls_sha256_free(m_ctx);
++        delete m_ctx;
++    }
++}
+ 
+ bool sha256::update(const uint8_t *message, size_t message_length)
+ {
+     if (!m_ctx) {
+         return false;
+     }
+-    return EVP_DigestUpdate(m_ctx, message, message_length);
++    return mbedtls_sha256_update(m_ctx, message, message_length) == 0;
+ }
+ 
+ bool sha256::digest(uint8_t *digest)
+@@ -418,23 +258,18 @@
+     if (!m_ctx) {
+         return false;
+     }
+-    unsigned int digest_length = 32;
+-    return EVP_DigestFinal(m_ctx, digest, &digest_length);
++    return mbedtls_sha256_finish(m_ctx, digest) == 0;
+ }
+ 
++/* AES-128-CBC with PKCS#7 padding */
+ bool aes_encrypt(const uint8_t *key, const uint8_t *iv, uint8_t *plaintext, int plen,
+                  uint8_t *ciphertext, int &clen)
+ {
+-    EVP_CIPHER_CTX *ctx;
+-    int len;
+-
+     /* Verify that the ciphertext buffer has enough storage room
+-     * for block size alignment padding which will be added
+-     * during encryption, which is up to plen + cipher_block_size -1
+-     * for the update, and another cipher_block_size for the final one.
++     * for the block size alignment padding.
+      */
+     int padlen = 16 - (plen % 16);
+-    if (clen < plen + padlen) {
++    if (plen < 0 || clen < plen + padlen) {
+         LOG(ERROR) << "Insufficient room for padding in ciphertext buffer" << std::endl
+                    << "plaintext len: " << plen << std::endl
+                    << "ciphertext len: " << clen << std::endl
+@@ -442,90 +277,71 @@
+         return false;
+     }
+ 
+-    ctx = EVP_CIPHER_CTX_new();
+-    if (NULL == ctx) {
+-        MAPF_ERR("Failed to create context");
+-        return false;
+-    }
++    std::copy_n(plaintext, plen, ciphertext);
++    std::fill_n(ciphertext + plen, padlen, static_cast<uint8_t>(padlen));
+ 
+-    if (EVP_EncryptInit_ex(ctx, EVP_aes_128_cbc(), NULL, key, iv) != 1) {
+-        MAPF_ERR("EVP_EncryptInit_ex Failed");
+-        EVP_CIPHER_CTX_free(ctx);
+-        return false;
+-    }
++    uint8_t iv_copy[16];
++    std::copy_n(iv, sizeof(iv_copy), iv_copy);
+ 
+-    /*
+-     * Provide the message to be encrypted, and obtain the encrypted output.
+-     * EVP_EncryptUpdate() encrypts inl bytes from the buffer in and writes
+-     * the encrypted version to out. The amount of data written depends on
+-     * the block alignment of the encrypted data: as a result the amount of
+-     * data written may be anything from zero bytes to
+-     * (inl + cipher_block_size - 1) so out should contain sufficient room.
+-     */
+-    if (EVP_EncryptUpdate(ctx, ciphertext, &len, plaintext, plen) != 1) {
+-        MAPF_ERR("EVP_EncryptUpdate Failed");
+-        EVP_CIPHER_CTX_free(ctx);
+-        return false;
+-    }
++    mbedtls_aes_context ctx;
++    mbedtls_aes_init(&ctx);
++    bool ok = mbedtls_aes_setkey_enc(&ctx, key, 128) == 0 &&
++              mbedtls_aes_crypt_cbc(&ctx, MBEDTLS_AES_ENCRYPT, plen + padlen, iv_copy, ciphertext,
++                                    ciphertext) == 0;
++    mbedtls_aes_free(&ctx);
+ 
+-    if (EVP_EncryptFinal_ex(ctx, ciphertext + len, &clen) != 1) {
+-        MAPF_ERR("EVP_EncryptFinal_ex Failed. clen=" << clen);
+-        EVP_CIPHER_CTX_free(ctx);
++    if (!ok) {
++        MAPF_ERR("AES encryption failed");
+         return false;
+     }
+-    clen += len;
+-
+-    EVP_CIPHER_CTX_free(ctx);
++    clen = plen + padlen;
+     return true;
+ }
+ 
+ bool aes_decrypt(const uint8_t *key, const uint8_t *iv, uint8_t *ciphertext, int clen,
+                  uint8_t *plaintext, int &plen)
+ {
+-    EVP_CIPHER_CTX *ctx;
+-    int len;
+-
+     /*
+-     * The decrypt operation will fail if  the final block is not correctly formatted.
+-     * This check requires the output buffer to have sufficient room for this check
+-     * which is (inl + cipher_block_size), which is clen + 16 in this case (aes128).
++     * Same requirement as with the previous OpenSSL implementation: the
++     * output buffer must have room for clen + one block.
+      */
+     if (plen < clen + 16) {
+         LOG(ERROR) << "Insufficient room for final block (padding) format check";
+         return false;
+     }
+-
+-    ctx = EVP_CIPHER_CTX_new();
+-    if (NULL == ctx) {
+-        MAPF_ERR("Failed to create context");
++    if (clen <= 0 || clen % 16 != 0) {
++        MAPF_ERR("AES decryption failed: bad ciphertext length " << clen);
+         return false;
+     }
+ 
+-    if (EVP_DecryptInit_ex(ctx, EVP_aes_128_cbc(), NULL, key, iv) != 1) {
+-        MAPF_ERR("EVP_DecryptInit_ex Failed");
+-        EVP_CIPHER_CTX_free(ctx);
+-        return false;
+-    }
++    uint8_t iv_copy[16];
++    std::copy_n(iv, sizeof(iv_copy), iv_copy);
++
++    mbedtls_aes_context ctx;
++    mbedtls_aes_init(&ctx);
++    bool ok = mbedtls_aes_setkey_dec(&ctx, key, 128) == 0 &&
++              mbedtls_aes_crypt_cbc(&ctx, MBEDTLS_AES_DECRYPT, clen, iv_copy, ciphertext,
++                                    plaintext) == 0;
++    mbedtls_aes_free(&ctx);
+ 
+-    if (EVP_DecryptUpdate(ctx, plaintext, &len, ciphertext, clen) != 1) {
+-        MAPF_ERR("EVP_DecryptUpdate Failed");
+-        EVP_CIPHER_CTX_free(ctx);
++    if (!ok) {
++        MAPF_ERR("AES decryption failed");
+         return false;
+     }
+-    plen = len;
+ 
+-    /*
+-     * Finalise the decryption. Further plaintext bytes may be written at
+-     * this stage.
+-     */
+-    if (EVP_DecryptFinal_ex(ctx, plaintext + plen, &len) != 1) {
+-        MAPF_ERR("EVP_DecryptFinal_ex Failed");
+-        EVP_CIPHER_CTX_free(ctx);
++    // Check and strip the PKCS#7 padding
++    uint8_t padlen = plaintext[clen - 1];
++    if (padlen == 0 || padlen > 16) {
++        MAPF_ERR("AES decryption failed: bad padding");
+         return false;
+     }
+-    plen += len;
+-
+-    EVP_CIPHER_CTX_free(ctx);
++    for (int i = clen - padlen; i < clen; i++) {
++        if (plaintext[i] != padlen) {
++            MAPF_ERR("AES decryption failed: bad padding");
++            return false;
++        }
++    }
++    plen = clen - padlen;
+     return true;
+ }
+ 
+diff --color -ru a/framework/common/hmac_wrapper.cpp b/framework/common/hmac_wrapper.cpp
+--- a/framework/common/hmac_wrapper.cpp
++++ b/framework/common/hmac_wrapper.cpp
+@@ -1,47 +1,29 @@
+ #include "hmac_wrapper.h"
+ 
+-#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+-#include <openssl/params.h>
+-#endif
++#include <algorithm>
++#include <mbedtls/md.h>
+ 
+ #include <mapf/common/logger.h>
+ 
+ hmac_wrapper::hmac_wrapper(const uint8_t *key, size_t key_length)
+-    :
+-#if OPENSSL_VERSION_NUMBER < 0x30000000L
+-      m_ctx(nullptr, &HMAC_CTX_free)
+-#else
+-      m_ctx(nullptr, &EVP_MAC_CTX_free)
+-#endif
++    : m_ctx(new mbedtls_md_context_t)
+ {
+-#if OPENSSL_VERSION_NUMBER < 0x30000000L
+-    HMAC_CTX *raw_ctx = HMAC_CTX_new();
+-#else
+-    EVP_MAC_CTX *raw_ctx = EVP_MAC_CTX_new(EVP_MAC_fetch(nullptr, "HMAC", nullptr));
+-#endif
+-
+-    if (!raw_ctx) {
+-        MAPF_ERR("HMAC_CTX_new failed");
+-        return;
+-    }
+-    m_ctx.reset(raw_ctx);
++    mbedtls_md_init(m_ctx.get());
+ 
+-#if OPENSSL_VERSION_NUMBER < 0x30000000L
+-    if (!HMAC_Init_ex(raw_ctx, key, key_length, EVP_sha256(), nullptr)) {
++    const mbedtls_md_info_t *info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
++    if (!info || mbedtls_md_setup(m_ctx.get(), info, 1) != 0 ||
++        mbedtls_md_hmac_starts(m_ctx.get(), key, key_length) != 0) {
++        MAPF_ERR("HMAC init failed");
++        mbedtls_md_free(m_ctx.get());
+         m_ctx.reset();
+-        MAPF_ERR("HMAC_Init_ex failed");
+-        return;
+     }
+-#else
+-    OSSL_PARAM params[2];
+-    params[0] = OSSL_PARAM_construct_utf8_string("digest", (char *)"SHA256", 0);
+-    params[1] = OSSL_PARAM_construct_end();
+-    if (!EVP_MAC_init(raw_ctx, key, key_length, params)) {
+-        m_ctx.reset();
+-        MAPF_ERR("EVP_MAC_init failed");
+-        return;
++}
++
++hmac_wrapper::~hmac_wrapper()
++{
++    if (m_ctx) {
++        mbedtls_md_free(m_ctx.get());
+     }
+-#endif
+ }
+ 
+ bool hmac_wrapper::update(const uint8_t *message, size_t message_length)
+@@ -51,17 +33,10 @@
+         return false;
+     }
+ 
+-#if OPENSSL_VERSION_NUMBER < 0x30000000L
+-    if (!HMAC_Update(m_ctx.get(), message, message_length)) {
+-        MAPF_ERR("HMAC_Update failed");
++    if (mbedtls_md_hmac_update(m_ctx.get(), message, message_length) != 0) {
++        MAPF_ERR("HMAC update failed");
+         return false;
+     }
+-#else
+-    if (!EVP_MAC_update(m_ctx.get(), message, message_length)) {
+-        MAPF_ERR("EVP_MAC_update failed");
+-        return false;
+-    }
+-#endif
+ 
+     return true;
+ }
+@@ -73,18 +48,12 @@
+         return false;
+     }
+ 
+-#if OPENSSL_VERSION_NUMBER < 0x30000000L
+-    auto len = static_cast<unsigned int>(digest_length);
+-    if (!HMAC_Final(m_ctx.get(), digest, &len)) {
+-        MAPF_ERR("HMAC_Final failed");
+-        return false;
+-    }
+-#else
+-    if (!EVP_MAC_final(m_ctx.get(), digest, &digest_length, digest_length)) {
+-        MAPF_ERR("EVP_MAC_final failed");
++    uint8_t out[32];
++    if (mbedtls_md_hmac_finish(m_ctx.get(), out) != 0) {
++        MAPF_ERR("HMAC final failed");
+         return false;
+     }
+-#endif
++    std::copy_n(out, std::min(digest_length, sizeof(out)), digest);
+ 
+     return true;
+ }
+diff --color -ru a/framework/common/hmac_wrapper.h b/framework/common/hmac_wrapper.h
+--- a/framework/common/hmac_wrapper.h
++++ b/framework/common/hmac_wrapper.h
+@@ -1,27 +1,23 @@
+ #ifndef HMAC_WRAPPER_H
+ #define HMAC_WRAPPER_H
+ 
++#include <cstddef>
++#include <cstdint>
+ #include <memory>
+-#include <openssl/evp.h>
+ 
+-#if OPENSSL_VERSION_NUMBER < 0x30000000L
+-#include <openssl/hmac.h>
+-#endif
++struct mbedtls_md_context_t;
+ 
++/* HMAC-SHA256 (mbed TLS backend) */
+ class hmac_wrapper {
+ public:
+     hmac_wrapper(const uint8_t *key, size_t key_length);
+-    ~hmac_wrapper() = default;
++    ~hmac_wrapper();
+ 
+     bool update(const uint8_t *message, size_t message_length);
+     bool digest(uint8_t *digest, size_t digest_length);
+ 
+ private:
+-#if OPENSSL_VERSION_NUMBER < 0x30000000L
+-    std::unique_ptr<HMAC_CTX, decltype(&HMAC_CTX_free)> m_ctx;
+-#else
+-    std::unique_ptr<EVP_MAC_CTX, decltype(&EVP_MAC_CTX_free)> m_ctx;
+-#endif
++    std::unique_ptr<mbedtls_md_context_t> m_ctx;
+ };
+ 
+ #endif // HMAC_WRAPPER_H
+diff --color -ru a/framework/common/include/mapf/common/encryption.h b/framework/common/include/mapf/common/encryption.h
+--- a/framework/common/include/mapf/common/encryption.h
++++ b/framework/common/include/mapf/common/encryption.h
+@@ -9,19 +9,11 @@
+ #ifndef ENCRYPTION_H_
+ #define ENCRYPTION_H_
+ 
+-#include <openssl/bn.h>
+-#include <openssl/engine.h>
+-#include <openssl/evp.h>
+-#include <openssl/ossl_typ.h>
+-
+ #include <cstddef>
+ #include <cstdint>
+ 
+-#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+-#include <memory>
+-#include <openssl/core_names.h>
+-#include <openssl/param_build.h>
+-#endif
++// Crypto backend: mbed TLS (kept out of this header on purpose)
++struct mbedtls_sha256_context;
+ 
+ namespace mapf {
+ 
+@@ -45,7 +37,7 @@
+     bool digest(uint8_t *digest);
+ 
+ private:
+-    EVP_MD_CTX *m_ctx;
++    mbedtls_sha256_context *m_ctx;
+ };
+ 
+ ///
+@@ -66,19 +58,6 @@
+ 
+     diffie_hellman &operator=(const diffie_hellman &) = delete;
+ 
+-#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+-    /**
+-     * @brief Creates remote EVP key from a public_key string
+-     *
+-     * @param[in] remote_pubkey The remote public key
+-     * @param[in] remote_pubkey_length Length of the remote public key
+-     * @param[out] peerPubKey The generated public key of the peer
+-     * @return true if successful, false if not.
+-     */
+-    bool create_peer_EVPKey(const uint8_t *remote_pubkey, size_t remote_pubkey_length,
+-                            std::unique_ptr<EVP_PKEY, decltype(&EVP_PKEY_free)> *peerPubKey) const;
+-#endif
+-
+     /**
+      * @brief Compute the shared secret key
+      *
+@@ -120,17 +99,10 @@
+     static const size_t max_pubkey_length = 192;
+ 
+ private:
+-#if OPENSSL_VERSION_NUMBER < 0x30000000L
+     /**
+-    * OpenSSL Diffie-Hellman state structure.
+-    */
+-    DH *m_dh;
+-#else
+-    /**
+-    * OpenSSL EVP state structure.
+-    */
+-    EVP_PKEY *m_evp;
+-#endif
++     * Private exponent, big endian. Only valid if m_pubkey is set.
++     */
++    uint8_t m_privkey[192];
+     /**
+      * If keypair generation failed in the constructor, this will be @a nullptr.
+      */

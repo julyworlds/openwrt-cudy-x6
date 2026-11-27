@@ -1,7 +1,8 @@
 # Local overlay of the prplmesh package from the "packages" feed.
 #
 # Nothing upstream is copied: the upstream Makefile, files/ and patches/
-# are used as they are, and the patches in ./patches are applied on top
+# are used as they are (only libopenssl is swapped for libmbedtls in
+# DEPENDS, see below), and the patches in ./patches are applied on top
 # of them. If an upstream update makes one of these patches stale, the
 # build stops in the patch step instead of silently dropping it.
 #
@@ -34,6 +35,14 @@ Hooks/Prepare/Post += Prplmesh/LocalPatches
 # Build for size (needs patches/190-cmake-optimize-for-size.patch).
 CMAKE_OPTIONS += -DPRPLMESH_OPTIMIZE_SIZE=ON
 
-include $(PRPLMESH_UPSTREAM_DIR)/Makefile
+# The upstream Makefile is read as is, with one change: libmbedtls instead
+# of libopenssl (needs patches/230-common-use-mbedtls-instead-of-openssl.patch).
+# If upstream changes that dependency, stop here instead of shipping a
+# package with a wrong dependency.
+PRPLMESH_UPSTREAM_MK:=$(file <$(PRPLMESH_UPSTREAM_DIR)/Makefile)
+ifeq ($(findstring +libopenssl ,$(PRPLMESH_UPSTREAM_MK)),)
+  $(error prplmesh overlay: upstream DEPENDS has no "+libopenssl" any more, review patches/230)
+endif
+$(eval $(subst +libopenssl ,+libmbedtls ,$(PRPLMESH_UPSTREAM_MK)))
 
 # call BuildPackage - OpenWrt buildroot signature (BuildPackage is called by the upstream Makefile)
