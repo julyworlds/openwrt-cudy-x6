@@ -4,7 +4,8 @@
 		"read": {
 			"uci": [ "prplmesh", "wireless" ],
 			"ubus": {
-				"service": [ "list" ]
+				"service": [ "list" ],
+				"luci-rpc": [ "getDHCPLeases" ]
 			},
 			"file": {
 				"/var/run/hostapd": [ "list" ],

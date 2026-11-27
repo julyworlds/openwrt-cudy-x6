@@ -18,6 +18,14 @@
 			"path": "prplmesh/status"
 		}
 	},
+	"admin/network/prplmesh/clients": {
+		"title": "Clients",
+		"order": 15,
+		"action": {
+			"type": "view",
+			"path": "prplmesh/clients"
+		}
+	},
 	"admin/network/prplmesh/settings": {
 		"title": "Settings",
 		"order": 20,
