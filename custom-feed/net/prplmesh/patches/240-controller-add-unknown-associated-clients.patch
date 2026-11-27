@@ -1,0 +1,52 @@
+From: prplmesh OpenWrt package
+Subject: [PATCH] controller: add clients reported only in Associated Clients TLV
+
+handle_associated_clients_tlv() only kept clients that were already in
+the database (the MLD check skipped stations it could not look up), so
+clients that were associated before prplMesh started never showed up:
+they are only reported in the Associated Clients TLV of the topology
+response, never in a Client Association Event. Treat an unknown client
+as a new non-MLD station and mark it connected the same way a Client
+Association Event does (channel, wireless backhaul type and
+handle_completed_connection()), so it appears in the topology and can
+be steered.
+
+--- a/controller/src/beerocks/master/tasks/topology_task.cpp
++++ b/controller/src/beerocks/master/tasks/topology_task.cpp
+@@ -844,9 +844,10 @@
+         wfa_map::cBssInfo &bss = std::get<1>(assoc_client_tlv->bss_list(i));
+         for (int j = 0; j < bss.clients_associated_list_length(); j++) {
+             wfa_map::cClientInfo &client = std::get<1>(bss.clients_associated_list(j));
+-            // Don't handle MLD STA
++            // Don't handle MLD STA. A client the controller doesn't know yet
++            // (already associated when prplMesh started) must be added too.
+             auto station = database.m_stations.get(client.mac());
+-            if (station && !station->is_mld) {
++            if (!station || !station->is_mld) {
+                 current_connected[client.mac()] = bss.bssid();
+             }
+         }
+@@ -860,7 +861,22 @@
+             continue;
+         }
+ 
+-        database.add_station(agent.al_mac, mac, bssid);
++        auto station = database.add_station(agent.al_mac, mac, bssid);
++        if (!station) {
++            LOG(ERROR) << "Failed to add associated client " << mac;
++            continue;
++        }
++
++        // Only reported here (e.g. associated before prplMesh started): mark it
++        // connected the same way a Client Association Event does, otherwise it
++        // stays out of the topology and can't be steered.
++        auto radio = database.get_radio_by_bssid(bssid);
++        if (radio) {
++            database.set_sta_wifi_channel(mac, database.get_radio_wifi_channel(radio->radio_uid));
++        }
++        database.set_sta_backhaul_iface_type(mac, beerocks::IFACE_TYPE_WIFI_UNSPECIFIED);
++        son_actions::handle_completed_connection(database, cmdu_tx, tasks,
++                                                 tlvf::mac_to_string(mac));
+     }
+ 
+     // Remove previously connected stations that are not connected anymore

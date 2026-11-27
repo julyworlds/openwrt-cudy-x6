@@ -1,0 +1,37 @@
+From: prplmesh OpenWrt package
+Subject: [PATCH] controller: keep station RSSI from Associated STA Link Metrics
+
+The uplink RCPI of Associated STA Link Metrics only went to the data
+model (NBAPI), while BML and the steering logic read the station stats,
+which are filled only from prplMesh vendor-specific messages. Stations of
+other EasyMesh agents therefore never had an RSSI (-127). Store the RCPI
+converted to RSSI in the station stats as well, and log the mismatching
+parent when a report is ignored.
+
+--- a/controller/src/beerocks/master/controller.cpp
++++ b/controller/src/beerocks/master/controller.cpp
+@@ -2446,9 +2446,23 @@
+         if (database.get_sta_parent(tlvf::mac_to_string(sta_link_metric->sta_mac())) !=
+             tlvf::mac_to_string(bssid_info.bssid)) {
+             LOG(INFO) << "Reported STA BSSID is not matching with datamodel. Reported bssid:"
+-                      << bssid_info.bssid;
++                      << bssid_info.bssid << " sta:" << sta_link_metric->sta_mac() << " db parent:"
++                      << database.get_sta_parent(tlvf::mac_to_string(sta_link_metric->sta_mac()));
+             continue;
+         }
++
++        // Keep the uplink RSSI in the station stats too: they are otherwise
++        // only filled from prplMesh vendor-specific messages, so stations of
++        // other EasyMesh agents never had an RSSI (BML showed -127) and
++        // steering had nothing to compare.
++        auto rcpi    = bssid_info.sta_measured_uplink_rcpi_dbm_enc;
++        auto station = database.get_station(sta_link_metric->sta_mac());
++        LOG(DEBUG) << "STA " << sta_link_metric->sta_mac() << " on " << bssid_info.bssid
++                   << " uplink RCPI " << int(rcpi);
++        if (station && station->stats_info && rcpi > 0 && rcpi <= beerocks::RCPI_MAX) {
++            station->stats_info->rx_rssi   = son::wireless_utils::convert_rssi_from_rcpi(rcpi);
++            station->stats_info->timestamp = std::chrono::steady_clock::now();
++        }
+         if (!database.dm_set_sta_link_metrics(sta_link_metric->sta_mac(),
+                                               bssid_info.downlink_estimated_mac_data_rate_mbps,
+                                               bssid_info.uplink_estimated_mac_data_rate_mbps,

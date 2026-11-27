@@ -1,0 +1,24 @@
+From: prplmesh OpenWrt package
+Subject: [PATCH] cli: print a client's RSSI even when its channel is unknown
+
+bml_conn_map printed rx_rssi only together with the client's channel, so
+a known RSSI was hidden for clients whose channel the controller doesn't
+know. Print it whenever it is valid.
+
+--- a/controller/src/beerocks/cli/beerocks_cli_bml.cpp
++++ b/controller/src/beerocks/cli/beerocks_cli_bml.cpp
+@@ -147,8 +147,12 @@
+                 ss << ", ch: " << std::to_string(node->channel) << ", bw: "
+                    << utils::convert_bandwidth_to_string((beerocks::eWiFiBandwidth)node->bw)
+                    << utils::convert_channel_ext_above_to_string(node->channel_ext_above_secondary,
+-                                                                 (beerocks::eWiFiBandwidth)node->bw)
+-                   << ", rx_rssi: " << std::to_string(node->rx_rssi);
++                                                                 (beerocks::eWiFiBandwidth)node->bw);
++            }
++            // The RSSI may be known (from Associated STA Link Metrics) even
++            // when the client's channel isn't, e.g. on third-party agents.
++            if (node->channel || node->rx_rssi != beerocks::RSSI_INVALID) {
++                ss << ", rx_rssi: " << std::to_string(node->rx_rssi);
+             }
+             ss << std::endl;
+ 
