@@ -80,7 +80,7 @@ function state(uci, wirelessIfaces, opts) {
 			status[dev].interfaces.push({ section: s['.name'], ifname: opts.ifnames[s['.name']] });
 	}
 	const ifaces = wirelessIfaces(status);
-	const onboarding = ifaces.filter(w => w.mode == 'ap' && w.multi_ap != '1' && w.ifname &&
+	const onboarding = ifaces.filter(w => w.mode == 'ap' && w.multi_ap != '1' &&
 		w.s.wps_pushbutton == '1' && (w.multi_ap == '2' || w.multi_ap == '3'));
 	return {
 		role: uci.get('prplmesh', 'config', 'management_mode') == 'Multi-AP-Agent' ? 'agent' : 'controller',
@@ -89,7 +89,8 @@ function state(uci, wirelessIfaces, opts) {
 		services: { prplmesh: { instances: { agent: { running: true }, controller: { running: opts.controller !== false } } } },
 		nodes: opts.nodes || [],
 		onboarding,
-		wps: onboarding.map(() => opts.wps === false ? null : { pbc_status: 'Disabled' })
+		wps: onboarding.map(w => (opts.wps === false || !w.ifname) ? null : { pbc_status: 'Disabled' }),
+		statusOk: !!opts.ifnames
 	};
 }
 
@@ -189,6 +190,17 @@ test('router: hostapd without WPS is reported', () => {
 	const { view, wirelessIfaces } = loadView(uci);
 	const titles = levels(view.checks(state(uci, wirelessIfaces, { ifnames: routerIfnames, wps: false })));
 	assert.ok(titles.some(t => /does not answer WPS/.test(t)), titles);
+});
+
+test('router: unreadable WiFi status is not reported as a missing WPS setup', () => {
+	/* the LuCI session lacks this app's permissions until the next login */
+	const uci = makeUci(configuredRouter);
+	const { view, wirelessIfaces } = loadView(uci);
+	const checks = view.checks(state(uci, wirelessIfaces, {}));
+	const titles = levels(checks);
+	assert.ok(titles.some(t => /WiFi status can't be read/.test(t)), titles);
+	assert.ok(!titles.some(t => /can't be added with WPS/.test(t)), titles);
+	assert.ok(checks.some(c => c.level == 'info' && /WPS onboarding configured on Home-5G/.test(c.title)));
 });
 
 test('router: WPA3-only backhaul is warned about', () => {

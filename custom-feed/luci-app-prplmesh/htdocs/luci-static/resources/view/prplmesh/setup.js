@@ -127,14 +127,16 @@ return view.extend({
 			r.splice(2, 2); /* dhcp, network: only loaded into uci */
 			var ifaces = wirelessIfaces(r[2] || {});
 			var sockets = (r[3] || []).map(function(e) { return e.name; });
+			/* Networks configured to onboard extenders (from the configuration;
+			 * their interface comes from netifd's status) */
 			var onboarding = ifaces.filter(function(w) {
-				return isFronthaulAp(w) && w.ifname && w.s.wps_pushbutton == '1' &&
+				return isFronthaulAp(w) && w.s.wps_pushbutton == '1' &&
 				       (w.multi_ap == '2' || w.multi_ap == '3');
 			});
 
 			/* WPS support of hostapd: wps_status answers */
 			return Promise.all(onboarding.map(function(w) {
-				return L.resolveDefault(hostapdCall(w.ifname, 'wps_status'), null);
+				return w.ifname ? L.resolveDefault(hostapdCall(w.ifname, 'wps_status'), null) : Promise.resolve(null);
 			})).then(function(wps) {
 				return {
 					role: uci.get('prplmesh', 'config', 'management_mode') == 'Multi-AP-Agent' ? 'agent' : 'controller',
@@ -143,7 +145,10 @@ return view.extend({
 					services: r[4] || {},
 					nodes: pm.parseConnMap(r[5] ? (r[5].stdout || '') : ''),
 					onboarding: onboarding,
-					wps: wps
+					wps: wps,
+					/* netifd status readable (needs this app's permissions,
+					 * granted at login) */
+					statusOk: Object.keys(r[2] || {}).length > 0
 				};
 			});
 		});
@@ -175,6 +180,10 @@ return view.extend({
 			add('error', _('The prplMesh controller is not running'), _('Check the system log (prplmesh).'));
 		else
 			add('ok', _('prplMesh is running'), mode);
+
+		if (!st.statusOk)
+			add('warn', _('The WiFi status can\'t be read'),
+				_('Interfaces and WPS can\'t be checked. After updating this app, log out of LuCI and in again (its permissions are granted at login).'));
 
 		/* Networks of the mesh */
 		if (!fronthauls.length)
@@ -242,12 +251,15 @@ return view.extend({
 			st.onboarding.forEach(function(w, i) {
 				var name = '%s (%s)'.format(w.ssid, bandName(w.band));
 				var bh = backhauls.filter(function(b) { return b.ssid == w.s.multi_ap_backhaul_ssid; })[0];
-				if (!st.wps[i])
-					add('error', _('hostapd on %s does not answer WPS requests').format(name),
-						_('The installed wpad/hostapd may lack WPS: install a full variant (e.g. wpad-mbedtls or wpad-openssl).'));
-				else if (!bh)
+				if (!bh)
 					add('error', _('%s hands out a backhaul network that doesn\'t exist').format(name),
 						_('multi_ap_backhaul_ssid is "%s". Run the setup below.').format(w.s.multi_ap_backhaul_ssid || ''));
+				else if (!w.ifname)
+					add('info', _('WPS onboarding configured on %s').format(name),
+						w.disabled ? _('The network is disabled.') : _('Its interface isn\'t known, so WPS can\'t be started from here (see above).'));
+				else if (!st.wps[i])
+					add('error', _('hostapd on %s does not answer WPS requests').format(name),
+						_('The installed wpad/hostapd may lack WPS: install a full variant (e.g. wpad-mbedtls or wpad-openssl).'));
 				else
 					add('ok', _('WPS onboarding ready on %s').format(name),
 						_('Extenders receive the backhaul network %s.').format(bh.ssid));
@@ -297,6 +309,10 @@ return view.extend({
 			add('error', _('The prplMesh agent is not running'), _('Check the system log (prplmesh).'));
 		else
 			add('ok', _('prplMesh agent is running'), _('This device is an extender: the main router configures its WiFi networks.'));
+
+		if (!st.statusOk)
+			add('warn', _('The WiFi status can\'t be read'),
+				_('After updating this app, log out of LuCI and in again (its permissions are granted at login).'));
 
 		/* Network: the main router is the only DHCP server and gateway */
 		if (uci.get('dhcp', 'lan') && uci.get('dhcp', 'lan', 'ignore') != '1')
@@ -741,7 +757,7 @@ return view.extend({
 				ev.target.remove();
 			} }, _('Show'))
 		]) : '';
-		var ready = st.onboarding.filter(function(w, i) { return st.wps[i]; });
+		var ready = st.onboarding.filter(function(w, i) { return w.ifname && st.wps[i]; });
 		var statusLine = E('span', { 'id': 'prplmesh-wps-status' },
 			ready.map(function(w) {
 				var s = st.wps[st.onboarding.indexOf(w)] || {};
@@ -804,7 +820,7 @@ return view.extend({
 		var container = E('div', { 'id': 'prplmesh-setup' }, this.renderAll(st));
 
 		poll.add(L.bind(function() {
-			var ready = st.onboarding.filter(function(w, i) { return st.wps[i]; });
+			var ready = st.onboarding.filter(function(w, i) { return w.ifname && st.wps[i]; });
 			return ready.length ? this.pollWps(ready) : Promise.resolve();
 		}, this), 5);
 
