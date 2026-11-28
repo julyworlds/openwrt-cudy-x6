@@ -6,8 +6,12 @@
 			"type": "firstchild"
 		},
 		"depends": {
-			"acl": [ "luci-app-prplmesh" ],
-			"uci": { "prplmesh": true }
+			"acl": [
+				"luci-app-prplmesh"
+			],
+			"uci": {
+				"prplmesh": true
+			}
 		}
 	},
 	"admin/network/prplmesh/status": {
@@ -32,6 +36,14 @@
 		"action": {
 			"type": "view",
 			"path": "prplmesh/settings"
+		}
+	},
+	"admin/network/prplmesh/setup": {
+		"title": "Setup",
+		"order": 5,
+		"action": {
+			"type": "view",
+			"path": "prplmesh/setup"
 		}
 	}
 }

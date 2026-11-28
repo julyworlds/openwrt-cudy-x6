@@ -2,22 +2,54 @@
 	"luci-app-prplmesh": {
 		"description": "Grant access to prplMesh (EasyMesh) status and settings",
 		"read": {
-			"uci": [ "prplmesh", "wireless" ],
+			"uci": [
+				"prplmesh",
+				"wireless"
+			],
 			"ubus": {
-				"service": [ "list" ],
-				"luci-rpc": [ "getDHCPLeases" ]
+				"service": [
+					"list"
+				],
+				"luci-rpc": [
+					"getDHCPLeases"
+				],
+				"network.wireless": [
+					"status"
+				],
+				"hostapd.*": [
+					"wps_status"
+				]
 			},
 			"file": {
-				"/var/run/hostapd": [ "list" ],
-				"/tmp/prplmesh_roaming_thresholds.json": [ "read" ],
-				"/usr/libexec/prplmesh/bin/beerocks_cli -c bml_conn_map": [ "exec" ]
+				"/var/run/hostapd": [
+					"list"
+				],
+				"/tmp/prplmesh_roaming_thresholds.json": [
+					"read"
+				],
+				"/usr/libexec/prplmesh/bin/beerocks_cli -c bml_conn_map": [
+					"exec"
+				]
 			}
 		},
 		"write": {
-			"uci": [ "prplmesh" ],
+			"uci": [
+				"prplmesh",
+				"wireless"
+			],
 			"file": {
-				"/usr/libexec/prplmesh/bin/beerocks_cli -c steer_client *": [ "exec" ],
-				"/etc/init.d/prplmesh restart": [ "exec" ]
+				"/usr/libexec/prplmesh/bin/beerocks_cli -c steer_client *": [
+					"exec"
+				],
+				"/etc/init.d/prplmesh restart": [
+					"exec"
+				]
+			},
+			"ubus": {
+				"hostapd.*": [
+					"wps_start",
+					"wps_cancel"
+				]
 			}
 		}
 	}
