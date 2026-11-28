@@ -99,6 +99,19 @@ return view.extend({
 		o.datatype = 'range(0,100)';
 		o.placeholder = '10';
 
+		o = s.taboption('steering', form.Flag, 'agent_steering', _('Let other agents steer their clients'),
+			_('For EasyMesh agents that are not prplMesh (for example a TP-Link extender). Disabled: the controller decides for their clients too, measuring them from this router. Enabled: the agent may move a client whose signal drops below the threshold below, to an access point it picks itself without measuring the others.'));
+		o.enabled = '2';
+		o.disabled = '0';
+		o.default = '0';
+		o.rmempty = false;
+
+		o = s.taboption('steering', form.Value, 'agent_steering_threshold_dbm', _('Agent steering threshold (dBm)'),
+			_('Signal below which such an agent may move a client. Keep it low (a poor signal), or the agent moves clients that are fine.'));
+		o.datatype = 'range(-110,-1)';
+		o.placeholder = '-75';
+		o.depends('agent_steering', '2');
+
 		o = s.taboption('channels', form.Flag, 'channel_select_task_enabled', _('Automatic channel selection'),
 			_('Lets the controller change channels and transmit power. Disable it to keep the channels set in Wireless.'));
 		o.default = '1';
