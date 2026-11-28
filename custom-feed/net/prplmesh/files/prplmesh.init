@@ -18,6 +18,10 @@ register_process() {
 	procd_open_instance "$name"
 	procd_set_param command "$@"
 	procd_set_param env PRPLMESH_DIR="$PRPLMESH_DIR"
+	# The daemons read their configuration once: a reload (Save & Apply)
+	# restarts them when it changed, which procd only does when an
+	# instance parameter changes, so track the file.
+	procd_set_param file /etc/config/prplmesh
 	procd_set_param respawn 3600 5 5
 	procd_set_param stdout 1
 	procd_set_param stderr 1
