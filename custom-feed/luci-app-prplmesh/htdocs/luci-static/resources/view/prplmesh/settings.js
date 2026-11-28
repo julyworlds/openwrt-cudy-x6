@@ -89,14 +89,15 @@ return view.extend({
 		o.default = '0';
 		o.rmempty = false;
 
+		o = s.taboption('steering', form.Flag, 'optimal_path_prefer_signal_strenght', _('Decide by signal strength'),
+			_('Choose the access point with the strongest signal as measured by the client (802.11k). When disabled, an estimated PHY rate is compared instead, which depends on the client capabilities.'));
+		o.default = '1';
+		o.rmempty = false;
+
 		o = s.taboption('steering', form.Value, 'roaming_hysteresis_percent_bonus', _('Roaming hysteresis (%)'),
-			_('How much better the target has to be before a client is moved.'));
+			_('Advantage given to the current access point so clients do not bounce. With signal strength it is a percentage of its signal: 10% is about 7 dB at -70 dBm.'));
 		o.datatype = 'range(0,100)';
 		o.placeholder = '10';
-
-		o = s.taboption('steering', form.Value, 'steering_disassoc_timer_msec', _('Disassociation timer (ms)'));
-		o.datatype = 'uinteger';
-		o.placeholder = '200';
 
 		o = s.taboption('channels', form.Flag, 'channel_select_task_enabled', _('Automatic channel selection'),
 			_('Lets the controller change channels and transmit power. Disable it to keep the channels set in Wireless.'));
