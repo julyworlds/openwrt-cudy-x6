@@ -112,14 +112,19 @@ return view.extend({
 	load: function() {
 		uci.unload('wireless');
 		uci.unload('prplmesh');
+		uci.unload('dhcp');
+		uci.unload('network');
 		return Promise.all([
 			uci.load('wireless'),
 			uci.load('prplmesh'),
+			L.resolveDefault(uci.load('dhcp'), null),
+			L.resolveDefault(uci.load('network'), null),
 			L.resolveDefault(callWirelessStatus(), {}),
 			L.resolveDefault(fs.list('/var/run/hostapd'), []),
 			L.resolveDefault(pm.callServiceList('prplmesh'), {}),
 			L.resolveDefault(fs.exec(pm.CLI, [ '-c', 'bml_conn_map' ]), null)
 		]).then(function(r) {
+			r.splice(2, 2); /* dhcp, network: only loaded into uci */
 			var ifaces = wirelessIfaces(r[2] || {});
 			var sockets = (r[3] || []).map(function(e) { return e.name; });
 			var onboarding = ifaces.filter(function(w) {
@@ -132,6 +137,7 @@ return view.extend({
 				return L.resolveDefault(hostapdCall(w.ifname, 'wps_status'), null);
 			})).then(function(wps) {
 				return {
+					role: uci.get('prplmesh', 'config', 'management_mode') == 'Multi-AP-Agent' ? 'agent' : 'controller',
 					ifaces: ifaces,
 					sockets: sockets,
 					services: r[4] || {},
@@ -146,6 +152,10 @@ return view.extend({
 	/* ---- Checks ------------------------------------------------------ */
 
 	checks: function(st) {
+		return st.role == 'agent' ? this.agentChecks(st) : this.controllerChecks(st);
+	},
+
+	controllerChecks: function(st) {
 		var list = [];
 		var add = function(level, title, detail, fix) {
 			list.push({ level: level, title: title, detail: detail, fix: fix });
@@ -270,6 +280,74 @@ return view.extend({
 		return list;
 	},
 
+	/* Checks of an extender (agent only). */
+	agentChecks: function(st) {
+		var list = [];
+		var add = function(level, title, detail, fix) {
+			list.push({ level: level, title: title, detail: detail, fix: fix });
+		};
+		var instances = L.isObject(st.services.prplmesh) ? (st.services.prplmesh.instances || {}) : {};
+		var sockets = {};
+		st.sockets.forEach(function(n) { sockets[n] = true; });
+
+		if (uci.get('prplmesh', 'config', 'enabled') != '1')
+			add('error', _('EasyMesh is disabled'), _('Run the setup below.'),
+				function() { uci.set('prplmesh', 'config', 'enabled', '1'); });
+		else if (!instances.agent || !instances.agent.running)
+			add('error', _('The prplMesh agent is not running'), _('Check the system log (prplmesh).'));
+		else
+			add('ok', _('prplMesh agent is running'), _('This device is an extender: the main router configures its WiFi networks.'));
+
+		/* Network: the main router is the only DHCP server and gateway */
+		if (uci.get('dhcp', 'lan') && uci.get('dhcp', 'lan', 'ignore') != '1')
+			add('error', _('This extender runs a DHCP server on its LAN'),
+				_('Only the main router may hand out addresses, or clients get wrong ones.'),
+				function() {
+					uci.set('dhcp', 'lan', 'ignore', '1');
+					uci.set('dhcp', 'lan', 'dhcpv6', 'disabled');
+					uci.set('dhcp', 'lan', 'ra', 'disabled');
+				});
+		if (uci.get('network', 'lan', 'proto') == 'static')
+			add('warn', _('The LAN has a fixed address'),
+				_('Make sure it is free in the main router\'s network, or let the main router give it one. After applying that, this page is at the address the main router assigns.'),
+				function() {
+					uci.set('network', 'lan', 'proto', 'dhcp');
+					['ipaddr', 'netmask', 'gateway', 'dns', 'ip6assign'].forEach(function(o) { uci.unset('network', 'lan', o); });
+				});
+
+		/* Radios: an access point prplMesh manages on each */
+		var devices = uci.sections('wireless', 'wifi-device');
+		devices.forEach(function(d) {
+			var managed = st.ifaces.filter(function(w) { return w.device == d['.name'] && w.mode == 'ap' && w.s.prplmesh == '1'; });
+			if (!managed.length)
+				add('error', _('No access point managed by EasyMesh on %s').format(bandName(d.band)),
+					_('The main router configures the networks on access points created for it. Run the setup below.'));
+			else if (managed.every(function(w) { return w.disabled; }))
+				add('warn', _('The EasyMesh access points of %s are disabled').format(bandName(d.band)),
+					_('They are enabled when the main router sends the networks.'));
+		});
+		uci.sections('prplmesh', 'wifi-device', function(r) {
+			if (r.hostap_iface && !sockets[r.hostap_iface])
+				add('error', _('prplMesh radio %s uses %s, which doesn\'t exist').format(r['.name'], r.hostap_iface),
+					_('Apply the setup (Save & Apply) or run it again.'));
+		});
+
+		/* Backhaul */
+		var bsta = st.ifaces.filter(function(w) { return w.mode == 'sta' && w.multi_ap == '1' && !w.disabled; })[0];
+		if (bsta) {
+			if (!bsta.ssid || !uci.get('wireless', bsta.section, 'key'))
+				add('error', _('The WiFi backhaul has no network or password'),
+					_('Enter the backhaul network shown on the main router\'s setup page.'));
+			else
+				add('ok', _('WiFi backhaul to %s (%s)').format(bsta.ssid, bandName(bsta.band)),
+					bsta.ifname ? _('Interface %s.').format(bsta.ifname) : _('Not up yet.'));
+		} else {
+			add('info', _('Wired backhaul'), _('Connect a LAN port of this extender to the main router (or another extender).'));
+		}
+
+		return list;
+	},
+
 	renderChecks: function(st) {
 		var self = this;
 		var icons = { ok: ['✔', 'green'], info: ['ℹ', '#06c'], warn: ['⚠', '#c80'], error: ['✖', '#c00'] };
@@ -316,6 +394,32 @@ return view.extend({
 
 	renderSetup: function(st) {
 		var self = this;
+		var controllerForm = this.renderControllerSetup(st);
+		var agentForm = this.renderAgentSetup(st);
+		var show = function(role) {
+			controllerForm.style.display = role == 'agent' ? 'none' : '';
+			agentForm.style.display = role == 'agent' ? '' : 'none';
+		};
+		var roleSelect = E('select', { 'class': 'cbi-input-select', 'change': function(ev) { show(ev.target.value); } }, [
+			E('option', { 'value': 'controller', 'selected': st.role != 'agent' ? '' : null }, _('Main router (controller + agent)')),
+			E('option', { 'value': 'agent', 'selected': st.role == 'agent' ? '' : null }, _('Extender (agent only)'))
+		]);
+		show(st.role);
+
+		return E('div', { 'class': 'cbi-section' }, [
+			E('h3', _('Easy setup')),
+			E('div', { 'class': 'cbi-value' }, [
+				E('label', { 'class': 'cbi-value-title' }, _('This device is')),
+				E('div', { 'class': 'cbi-value-field' }, [ roleSelect, E('div', { 'class': 'cbi-value-description' },
+					_('One main router runs the controller and decides for the whole mesh; OpenWrt extenders only run the agent and get their networks from it.')) ])
+			]),
+			controllerForm,
+			agentForm
+		]);
+	},
+
+	renderControllerSetup: function(st) {
+		var self = this;
 		var aps = st.ifaces.filter(isFronthaulAp);
 		var current = {};
 		meshFronthauls(st.ifaces).forEach(function(w) { current[w.section] = true; });
@@ -339,8 +443,7 @@ return view.extend({
 		var ssidInput = E('input', { 'class': 'cbi-input-text', 'type': 'text',
 			'value': existingBh ? existingBh.ssid : '', 'placeholder': _('automatic (first network + "-BH")') });
 
-		return E('div', { 'class': 'cbi-section' }, [
-			E('h3', _('Easy setup')),
+		return E('div', {}, [
 			E('p', { 'class': 'cbi-section-descr' },
 				_('Pick the WiFi networks of the mesh: the extenders will broadcast them too and clients roam between all access points. The setup creates the hidden backhaul network (random password) if there is none, enables 802.11k/v, Multi-AP and WPS on the networks, and writes the EasyMesh configuration. Nothing is applied until you Save & Apply.')),
 			E('div', { 'class': 'cbi-value' }, [
@@ -500,10 +603,144 @@ return view.extend({
 			setIf('prplmesh', 'config', 'management_mode', 'Multi-AP-Controller-and-Agent');
 	},
 
+	renderAgentSetup: function(st) {
+		var self = this;
+		var devices = uci.sections('wireless', 'wifi-device');
+		var bsta = st.ifaces.filter(function(w) { return w.mode == 'sta' && w.multi_ap == '1'; })[0];
+		var bhSelect = E('select', { 'class': 'cbi-input-select' }, [
+			E('option', { 'value': 'wired', 'selected': !bsta || bsta.disabled ? '' : null }, _('Cable to the main router'))
+		].concat(devices.map(function(d) {
+			return E('option', { 'value': d['.name'], 'selected': bsta && !bsta.disabled && bsta.device == d['.name'] ? '' : null },
+				_('WiFi, %s').format(bandName(d.band)));
+		})));
+		var ssidInput = E('input', { 'class': 'cbi-input-text', 'type': 'text', 'value': bsta ? bsta.ssid : '' });
+		var keyInput = E('input', { 'class': 'cbi-input-password', 'type': 'password',
+			'value': bsta ? (uci.get('wireless', bsta.section, 'key') || '') : '' });
+
+		return E('div', {}, [
+			E('p', { 'class': 'cbi-section-descr' },
+				_('Prepares this device as an extender: EasyMesh agent only, an access point on each radio for the networks the main router sends, and the backhaul to the main router. Turn off its DHCP server too (see the checks). Nothing is applied until you Save & Apply.')),
+			E('div', { 'class': 'cbi-value' }, [
+				E('label', { 'class': 'cbi-value-title' }, _('Backhaul')),
+				E('div', { 'class': 'cbi-value-field' }, bhSelect)
+			]),
+			E('div', { 'class': 'cbi-value' }, [
+				E('label', { 'class': 'cbi-value-title' }, _('Backhaul network')),
+				E('div', { 'class': 'cbi-value-field' }, [ ssidInput, E('div', { 'class': 'cbi-value-description' },
+					_('For a WiFi backhaul: the backhaul network and password shown on the main router\'s setup page.')) ])
+			]),
+			E('div', { 'class': 'cbi-value' }, [
+				E('label', { 'class': 'cbi-value-title' }, _('Backhaul password')),
+				E('div', { 'class': 'cbi-value-field' }, keyInput)
+			]),
+			E('div', { 'class': 'right' }, E('button', {
+				'class': 'btn cbi-button cbi-button-action important',
+				'click': ui.createHandlerFn(self, function() {
+					var bh = bhSelect.value;
+					if (bh != 'wired' && (!ssidInput.value.trim() || keyInput.value.length < 8)) {
+						ui.addNotification(null, E('p', _('Enter the backhaul network and its password (8 characters or more).')), 'warning');
+						return;
+					}
+					self.prepareAgent(st, bh, ssidInput.value.trim(), keyInput.value);
+					return self.staged();
+				})
+			}, _('Prepare configuration')))
+		]);
+	},
+
+	/* Extender: agent only, a managed access point per radio, backhaul. */
+	prepareAgent: function(st, bh, bhSsid, bhKey) {
+		var devices = uci.sections('wireless', 'wifi-device');
+		var bandOf = {};
+		devices.forEach(function(d) { bandOf[d['.name']] = d.band; });
+
+		setIf('prplmesh', 'config', 'enabled', '1');
+		setIf('prplmesh', 'config', 'management_mode', 'Multi-AP-Agent');
+		setIf('prplmesh', 'config', 'backhaul_wire_iface', 'br-lan');
+		setIf('prplmesh', 'config', 'backhaul_band',
+			bh == 'wired' ? 'auto' : ({ '2g': '2.4GHz', '5g': '5GHz', '6g': '6GHz' }[bandOf[bh]] || 'auto'));
+
+		/* Backhaul station */
+		var bsta = st.ifaces.filter(function(w) { return w.mode == 'sta' && w.multi_ap == '1'; })[0];
+		var staIface = 'pm-bsta';
+		if (bh == 'wired') {
+			if (bsta)
+				setIf('wireless', bsta.section, 'disabled', '1');
+		} else {
+			var sid = bsta ? bsta.section : uci.add('wireless', 'wifi-iface', 'pm_bsta');
+			setIf('wireless', sid, 'device', bh);
+			setIf('wireless', sid, 'mode', 'sta');
+			setIf('wireless', sid, 'network', 'lan');
+			setIf('wireless', sid, 'ifname', staIface);
+			setIf('wireless', sid, 'ssid', bhSsid);
+			setIf('wireless', sid, 'encryption', 'psk2');
+			setIf('wireless', sid, 'key', bhKey);
+			setIf('wireless', sid, 'multi_ap', '1');
+			setIf('wireless', sid, 'wds', '1');
+			setIf('wireless', sid, 'prplmesh', '1');
+			if (uci.get('wireless', sid, 'disabled') != null)
+				uci.unset('wireless', sid, 'disabled');
+		}
+
+		/* An access point managed by EasyMesh on each radio: the main router
+		 * sends the networks, the agent keeps them in these sections. */
+		var mandatory = [];
+		uci.sections('prplmesh', 'wifi-device', function(r) {
+			if (!bandOf[r['.name']])
+				uci.remove('prplmesh', r['.name']);
+		});
+		devices.forEach(function(d) {
+			var dev = d['.name'];
+			var ap = st.ifaces.filter(function(w) { return w.device == dev && w.mode == 'ap' && w.s.prplmesh == '1'; })[0];
+			var apSid = ap ? ap.section : uci.add('wireless', 'wifi-iface', 'pm_' + dev + '_ap');
+			var apIface = (ap && ap.s.ifname) || ('pm-' + dev + '-ap');
+			if (!ap) {
+				uci.set('wireless', apSid, 'device', dev);
+				uci.set('wireless', apSid, 'mode', 'ap');
+				uci.set('wireless', apSid, 'network', 'lan');
+				uci.set('wireless', apSid, 'ssid', 'EasyMesh-' + dev);
+				uci.set('wireless', apSid, 'encryption', 'psk2');
+				uci.set('wireless', apSid, 'key', randomKey());
+				uci.set('wireless', apSid, 'hidden', '1');
+				uci.set('wireless', apSid, 'prplmesh', '1');
+			}
+			setIf('wireless', apSid, 'ifname', apIface);
+			if (uci.get('wireless', dev, 'disabled') != null)
+				uci.unset('wireless', dev, 'disabled');
+
+			var rid = uci.get('prplmesh', dev) ? dev : uci.add('prplmesh', 'wifi-device', dev);
+			setIf('prplmesh', rid, 'wireless_device', dev);
+			setIf('prplmesh', rid, 'wireless_section', apSid);
+			setIf('prplmesh', rid, 'hostap_iface', apIface);
+			setIf('prplmesh', rid, 'hostap_iface_steer_vaps', apIface);
+			if (bh == dev)
+				setIf('prplmesh', rid, 'sta_iface', staIface);
+			else if (uci.get('prplmesh', rid, 'sta_iface') != null)
+				uci.unset('prplmesh', rid, 'sta_iface');
+			mandatory.push(apIface);
+		});
+		setIf('prplmesh', 'config', 'mandatory_interfaces', mandatory.sort().join(','));
+	},
+
 	/* ---- WPS ----------------------------------------------------------- */
 
 	renderWps: function(st) {
 		var self = this;
+		if (st.role == 'agent')
+			return E('div', { 'class': 'cbi-section' }, [
+				E('h3', _('Join the mesh')),
+				E('p', { 'class': 'cbi-section-descr' },
+					_('With a cable backhaul it joins on its own once applied. With a WiFi backhaul, enter the backhaul network shown on the main router\'s setup page above; it then connects and gets the networks from the main router.'))
+			]);
+		var bh = st.ifaces.filter(isBackhaul)[0];
+		var keyCell = E('code', {}, '••••••••');
+		var creds = bh ? E('p', {}, [
+			_('For OpenWrt extenders with a WiFi backhaul: network '), E('code', {}, bh.ssid), _(', password '), keyCell, ' ',
+			E('button', { 'class': 'btn cbi-button', 'click': function(ev) {
+				keyCell.textContent = uci.get('wireless', bh.section, 'key') || '';
+				ev.target.remove();
+			} }, _('Show'))
+		]) : '';
 		var ready = st.onboarding.filter(function(w, i) { return st.wps[i]; });
 		var statusLine = E('span', { 'id': 'prplmesh-wps-status' },
 			ready.map(function(w) {
@@ -536,7 +773,8 @@ return view.extend({
 					})
 				}, _('Cancel')), ' ',
 				E('small', {}, [ _('Status: '), statusLine ])
-			]) : E('em', _('WPS onboarding isn\'t ready: see the checks above.'))
+			]) : E('em', _('WPS onboarding isn\'t ready: see the checks above.')),
+			creds
 		]);
 	},
 
@@ -573,7 +811,7 @@ return view.extend({
 		return E('div', {}, [
 			E('h2', _('EasyMesh setup')),
 			E('div', { 'class': 'cbi-map-descr' },
-				_('Checks what EasyMesh needs, prepares the configuration of the main router and adds extenders with WPS.')),
+				_('Checks what EasyMesh needs, prepares the configuration of the main router or of an OpenWrt extender, and adds extenders with WPS.')),
 			container
 		]);
 	},

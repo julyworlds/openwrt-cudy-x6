@@ -4,7 +4,9 @@
 		"read": {
 			"uci": [
 				"prplmesh",
-				"wireless"
+				"wireless",
+				"dhcp",
+				"network"
 			],
 			"ubus": {
 				"service": [
@@ -35,7 +37,9 @@
 		"write": {
 			"uci": [
 				"prplmesh",
-				"wireless"
+				"wireless",
+				"dhcp",
+				"network"
 			],
 			"file": {
 				"/usr/libexec/prplmesh/bin/beerocks_cli -c steer_client *": [
