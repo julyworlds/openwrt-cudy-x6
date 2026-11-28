@@ -8,6 +8,8 @@
 function capFlag(v) {
 	if (v === true)
 		return E('span', { 'style': 'color:green', 'title': _('Supported') }, '✓');
+	if (v === 'table')
+		return E('span', { 'style': 'color:#c80', 'title': _('Only from its last scan (table mode); some devices, like macOS, answer it empty') }, _('✓ (table)'));
 	if (v === false)
 		return E('span', { 'style': 'color:#c00', 'title': _('Not supported') }, '✗');
 	return E('span', { 'title': _('Unknown') }, '?');

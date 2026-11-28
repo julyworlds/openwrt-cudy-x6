@@ -29,7 +29,8 @@ var callServiceList = rpc.declare({
  *     RADIO: wlan1 mac: .., ch: 36, bw: 80MHzL, freq: 5180MHz
  *         fVAP[0]: wlan1.0 bssid: .., ssid: ..
  *             CLIENT: mac: .., ipv4: .., name: .., ch: 36, bw: 80MHzL, rx_rssi: -60
- * (name, ch/bw, rx_rssi and "11k: 0|1|?, 11v: 0|1" only when known)
+ * (name, ch/bw, rx_rssi and "11k: 0|1|t|?, 11v: 0|1" only when known; t: beacon
+ * reports from the scan table only)
  *     IRE_BRIDGE: name: .., AL-MAC: .., ipv4: .., Status: Active
  */
 function parseConnMap(text) {
@@ -87,14 +88,14 @@ function parseConnMap(text) {
 			};
 			radio.vaps.push(vap);
 		}
-		else if (vap && (m = line.match(/CLIENT: mac: ([0-9a-fA-F:]+), ipv4: ([^,]*)(?:, name: ([^,]*))?(?:, ch: (\d+), bw: ([^,]+))?(?:, rx_rssi: (-?\d+))?(?:, 11k: ([01?]), 11v: ([01]))?/))) {
+		else if (vap && (m = line.match(/CLIENT: mac: ([0-9a-fA-F:]+), ipv4: ([^,]*)(?:, name: ([^,]*))?(?:, ch: (\d+), bw: ([^,]+))?(?:, rx_rssi: (-?\d+))?(?:, 11k: ([01?t]), 11v: ([01]))?/))) {
 			vap.clients.push({
 				mac: m[1],
 				ipv4: m[2],
 				name: m[3] || '',
 				rssi: m[6] != null ? +m[6] : null,
 				/* true / false / null (unknown) */
-				k11: m[7] == '1' ? true : (m[7] == '0' ? false : null),
+				k11: m[7] == '1' ? true : (m[7] == '0' ? false : (m[7] == 't' ? 'table' : null)),
 				v11: m[8] == '1' ? true : (m[8] == '0' ? false : null)
 			});
 		}
