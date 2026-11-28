@@ -3,6 +3,7 @@
 'require form';
 'require fs';
 'require uci';
+'require tools.prplmesh as pm';
 
 /* hostapd control sockets: one per BSS, named after the netdev */
 function loadHostapdIfaces() {
@@ -23,13 +24,21 @@ return view.extend({
 	load: function() {
 		return Promise.all([
 			loadHostapdIfaces(),
-			uci.load('wireless')
+			uci.load('wireless'),
+			/* agents of the mesh, for the per agent roaming thresholds */
+			L.resolveDefault(fs.exec(pm.CLI, [ '-c', 'bml_conn_map' ]), null),
+			/* thresholds in use, written by the controller */
+			L.resolveDefault(fs.read('/tmp/prplmesh_roaming_thresholds.json'), '{}'),
+			uci.load('prplmesh')
 		]);
 	},
 
 	render: function(data) {
 		var hostapdIfaces = data[0] || [];
-		var m, s, o;
+		var agents = pm.parseConnMap(data[2] ? (data[2].stdout || '') : '');
+		var thresholds = {};
+		try { thresholds = JSON.parse(data[3] || '{}') || {}; } catch (e) {}
+		var m, s, o, ss;
 
 		m = new form.Map('prplmesh', _('EasyMesh settings'),
 			_('Basic prplMesh (EasyMesh) configuration. The service is restarted automatically when the settings are applied.'));
@@ -39,6 +48,8 @@ return view.extend({
 		s.tab('general', _('General'));
 		s.tab('steering', _('Roaming / steering'));
 		s.tab('channels', _('Channels'));
+		s.tab('radios', _('Radios'));
+		s.tab('networks', _('Networks (SSIDs)'));
 
 		o = s.taboption('general', form.Flag, 'enabled', _('Enable EasyMesh'));
 		o.rmempty = false;
@@ -112,6 +123,67 @@ return view.extend({
 		o.placeholder = '-75';
 		o.depends('agent_steering', '2');
 
+		/* Roaming threshold per agent: stored in "agent" sections (al_mac,
+		 * roaming_threshold_dbm, roaming_threshold_24g_dbm); empty means the
+		 * automatic value the controller derives from the mesh links. */
+		o = s.taboption('steering', form.DummyValue, '_rt_title', _('Roaming threshold per agent'));
+		o.default = '';
+		o.description = _('Clients whose signal drops below the threshold of their agent are evaluated and may be moved to another one. By default it is automatic: the signal at which the agent hears its nearest other agent plus 4 dB, shown in each empty field. Type a value to use it instead; clear it to go back to the automatic one. The 2.4 GHz value follows the 5 GHz one (plus the band difference) unless set.');
+
+		function agentSection(almac) {
+			var sid = null;
+			uci.sections('prplmesh', 'agent', function(a) {
+				if (String(a.al_mac || '').toLowerCase() == almac)
+					sid = a['.name'];
+			});
+			return sid;
+		}
+
+		function thresholdOption(almac, title, opt, auto) {
+			var o = s.taboption('steering', form.Value, 'rt_%s_%s'.format(opt, almac.replace(/:/g, '')), title);
+			o.datatype = 'range(-110,-1)';
+			o.placeholder = (auto != null) ? _('%d (automatic)').format(auto) : _('automatic');
+			o.cfgvalue = function() {
+				var sid = agentSection(almac);
+				return sid ? uci.get('prplmesh', sid, opt) : null;
+			};
+			o.write = function(section_id, value) {
+				var sid = agentSection(almac);
+				if (!sid) {
+					sid = uci.add('prplmesh', 'agent');
+					uci.set('prplmesh', sid, 'al_mac', almac);
+				}
+				uci.set('prplmesh', sid, opt, value);
+			};
+			o.remove = function() {
+				var sid = agentSection(almac);
+				if (!sid)
+					return;
+				uci.unset('prplmesh', sid, opt);
+				if (!uci.get('prplmesh', sid, 'roaming_threshold_dbm') &&
+				    !uci.get('prplmesh', sid, 'roaming_threshold_24g_dbm'))
+					uci.remove('prplmesh', sid);
+			};
+			return o;
+		}
+
+		/* connected agents, then configured ones that are not connected now */
+		var listed = {};
+		agents.forEach(function(a) {
+			listed[a.almac.toLowerCase()] = a.gateway ? _('Router (controller)') : a.name;
+		});
+		uci.sections('prplmesh', 'agent', function(a) {
+			var mac = String(a.al_mac || '').toLowerCase();
+			if (mac && !(mac in listed))
+				listed[mac] = _('not connected');
+		});
+		Object.keys(listed).forEach(function(mac) {
+			var t = thresholds[mac] || {};
+			var name = '%s (%s)'.format(listed[mac], mac);
+			thresholdOption(mac, _('%s – 5/6 GHz (dBm)').format(name), 'roaming_threshold_dbm', t.auto_dbm);
+			thresholdOption(mac, _('%s – 2.4 GHz (dBm)').format(name), 'roaming_threshold_24g_dbm', t.auto_24g_dbm);
+		});
+
 		o = s.taboption('channels', form.Flag, 'channel_select_task_enabled', _('Automatic channel selection'),
 			_('Lets the controller change channels and transmit power. Disable it to keep the channels set in Wireless.'));
 		o.default = '1';
@@ -126,23 +198,24 @@ return view.extend({
 		o.rmempty = false;
 
 		/* Radios */
-		s = m.section(form.TypedSection, 'wifi-device', _('Radios'),
+		o = s.taboption('radios', form.SectionValue, '_radios', form.TypedSection, 'wifi-device', _('Radios'),
 			_('Which hostapd interface prplMesh manages on each radio. Any name works (for example phy1-ap0 or wlan1); it no longer has to be renamed to wlanN.'));
-		s.anonymous = false;
-		s.addremove = true;
-		s.addbtntitle = _('Add radio');
+		ss = o.subsection;
+		ss.anonymous = false;
+		ss.addremove = true;
+		ss.addbtntitle = _('Add radio');
 
-		o = s.option(form.ListValue, 'wireless_device', _('Radio'));
+		o = ss.option(form.ListValue, 'wireless_device', _('Radio'));
 		uci.sections('wireless', 'wifi-device').forEach(function(d) {
 			o.value(d['.name'], '%s (%s)'.format(d['.name'], d.band || d.hwmode || '?'));
 		});
 
-		o = s.option(form.Value, 'hostap_iface', _('Interface'),
+		o = ss.option(form.Value, 'hostap_iface', _('Interface'),
 			_('Main hostapd interface of this radio.'));
 		hostapdIfaces.forEach(function(i) { o.value(i); });
 		o.rmempty = false;
 
-		o = s.option(form.ListValue, 'wireless_section', _('Wireless network'),
+		o = ss.option(form.ListValue, 'wireless_section', _('Wireless network'),
 			_('The wireless section (Network → Wireless) behind that interface.'));
 		uci.sections('wireless', 'wifi-iface').forEach(function(w) {
 			if (w.mode == 'ap')
@@ -150,32 +223,33 @@ return view.extend({
 		});
 
 		/* plain option string (comma separated), not a UCI list */
-		o = s.option(form.Value, 'hostap_iface_steer_vaps', _('Steerable interfaces'),
+		o = ss.option(form.Value, 'hostap_iface_steer_vaps', _('Steerable interfaces'),
 			_('Comma separated interfaces on which clients may be steered. Usually the same as Interface.'));
 		hostapdIfaces.forEach(function(i) { o.value(i); });
 
 		/* BSS profiles */
-		s = m.section(form.TypedSection, 'bss_profile', _('Networks (SSIDs)'),
+		o = s.taboption('networks', form.SectionValue, '_networks', form.TypedSection, 'bss_profile', _('Networks (SSIDs)'),
 			_('Networks the controller configures on every node of the mesh. Fronthaul is for clients; backhaul links the nodes (usually hidden, 5 GHz).'));
-		s.anonymous = false;
-		s.addremove = true;
-		s.addbtntitle = _('Add network');
+		ss = o.subsection;
+		ss.anonymous = false;
+		ss.addremove = true;
+		ss.addbtntitle = _('Add network');
 
-		o = s.option(form.Value, 'ssid', _('SSID'));
+		o = ss.option(form.Value, 'ssid', _('SSID'));
 		o.rmempty = false;
 
-		o = s.option(form.ListValue, 'encryption', _('Encryption'));
+		o = ss.option(form.ListValue, 'encryption', _('Encryption'));
 		o.value('psk2', 'WPA2-PSK');
 		o.value('sae-mixed', 'WPA2/WPA3 (mixed)');
 		o.value('sae', 'WPA3-SAE');
 		o.default = 'sae-mixed';
 
-		o = s.option(form.Value, 'key', _('Password'));
+		o = ss.option(form.Value, 'key', _('Password'));
 		o.password = true;
 		o.datatype = 'wpakey';
 		o.modalonly = true;
 
-		o = s.option(form.MultiValue, 'bands', _('Bands'));
+		o = ss.option(form.MultiValue, 'bands', _('Bands'));
 		o.value('2g', '2.4 GHz');
 		o.value('5g', '5 GHz');
 		o.value('6g', '6 GHz');
@@ -188,11 +262,11 @@ return view.extend({
 			uci.set('prplmesh', section_id, 'bands', L.toArray(value).join(' '));
 		};
 
-		o = s.option(form.Flag, 'fronthaul', _('Fronthaul'));
+		o = ss.option(form.Flag, 'fronthaul', _('Fronthaul'));
 		o.default = '1';
 		o.rmempty = false;
 
-		o = s.option(form.Flag, 'backhaul', _('Backhaul'));
+		o = ss.option(form.Flag, 'backhaul', _('Backhaul'));
 		o.default = '0';
 		o.rmempty = false;
 

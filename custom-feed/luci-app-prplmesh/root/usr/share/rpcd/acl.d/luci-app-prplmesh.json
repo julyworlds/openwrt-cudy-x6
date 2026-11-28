@@ -9,6 +9,7 @@
 			},
 			"file": {
 				"/var/run/hostapd": [ "list" ],
+				"/tmp/prplmesh_roaming_thresholds.json": [ "read" ],
 				"/usr/libexec/prplmesh/bin/beerocks_cli -c bml_conn_map": [ "exec" ]
 			}
 		},
