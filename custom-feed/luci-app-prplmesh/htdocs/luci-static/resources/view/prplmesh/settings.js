@@ -60,6 +60,7 @@ return view.extend({
 		o.value('Multi-AP-Controller', _('Controller only'));
 		o.value('Multi-AP-Agent', _('Agent only (satellite)'));
 		o.default = 'Multi-AP-Controller-and-Agent';
+		o.rmempty = false; /* prplMesh reads it: LuCI drops values equal to the default */
 
 		o = s.taboption('general', form.DynamicList, 'mandatory_interfaces', _('Required interfaces'),
 			_('The agent waits for these hostapd interfaces before starting. Normally the interfaces of all radios below.'));
@@ -81,6 +82,7 @@ return view.extend({
 		o.value('2.4GHz', '2.4 GHz');
 		o.value('5GHz', '5 GHz');
 		o.default = 'auto';
+		o.rmempty = false; /* prplMesh reads it: LuCI drops values equal to the default */
 
 		o = s.taboption('steering', form.Flag, 'client_roaming', _('Client steering'),
 			_('Move clients to the access point with the best signal.'));
@@ -248,6 +250,7 @@ return view.extend({
 		o.value('sae-mixed', 'WPA2/WPA3 (mixed)');
 		o.value('sae', 'WPA3-SAE');
 		o.default = 'sae-mixed';
+		o.rmempty = false; /* prplMesh reads it: LuCI drops values equal to the default */
 
 		o = ss.option(form.Value, 'key', _('Password'));
 		o.password = true;
