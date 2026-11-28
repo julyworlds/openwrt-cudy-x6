@@ -16,9 +16,9 @@ PKG_RELEASE:=1
 
 PKG_SOURCE_PROTO:=git
 PKG_SOURCE_URL:=https://github.com/julyworlds/prplMesh.git
-PKG_MIRROR_HASH:=737eaedd60d70b10e4091b69ab9d4487639a49e925d773a418b853803d86c4c2
+PKG_MIRROR_HASH:=89177b0fcf16f63dad1440312387bb2040eb3d9e5fffe25d88bc59f681ff5833
 PKG_SOURCE_DATE:=2026-11-28
-PKG_SOURCE_VERSION:=6ac7e800c965dd5b20b7d7c9169dd550b6007b7f
+PKG_SOURCE_VERSION:=93af0fdadb9bb44662c4358594f08739ac1fdb91
 # The commit is part of the archive name so a new fork commit never reuses a
 # cached tarball of an older one.
 PKG_SOURCE:=$(PKG_NAME)-$(PKG_VERSION)-$(PKG_SOURCE_VERSION).tar.zst
