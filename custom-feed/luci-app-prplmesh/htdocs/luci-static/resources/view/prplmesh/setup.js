@@ -16,9 +16,12 @@
  * "Save & Apply".
  */
 
+/* netifd's wireless status with each interface's section and netdev. Not
+ * network.wireless status itself: through rpcd it gets the session as an
+ * extra argument, which netifd rejects (invalid argument). */
 var callWirelessStatus = rpc.declare({
-	object: 'network.wireless',
-	method: 'status',
+	object: 'luci-rpc',
+	method: 'getWirelessDevices',
 	expect: { '': {} }
 });
 

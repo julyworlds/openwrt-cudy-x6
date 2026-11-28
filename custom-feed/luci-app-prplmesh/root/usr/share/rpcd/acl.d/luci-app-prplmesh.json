@@ -13,10 +13,8 @@
 					"list"
 				],
 				"luci-rpc": [
-					"getDHCPLeases"
-				],
-				"network.wireless": [
-					"status"
+					"getDHCPLeases",
+					"getWirelessDevices"
 				],
 				"hostapd.*": [
 					"wps_status"
