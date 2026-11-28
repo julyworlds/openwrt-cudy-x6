@@ -65,10 +65,19 @@ function hasBssOption(s, opt) {
 	return L.toArray(s.hostapd_bss_options).some(function(o) { return o.split('=')[0] == opt.split('=')[0]; });
 }
 
+/* Set an option only when it changes, so running the setup again on a
+ * configured router stages nothing. */
+function setIf(conf, sid, opt, val) {
+	var cur = uci.get(conf, sid, opt);
+	if (L.toArray(cur).join('\n') !== L.toArray(val).join('\n'))
+		uci.set(conf, sid, opt, val);
+}
+
 function addBssOption(section, opt) {
-	var list = L.toArray(uci.get('wireless', section, 'hostapd_bss_options')).filter(function(o) {
-		return o.split('=')[0] != opt.split('=')[0];
-	});
+	var cur = L.toArray(uci.get('wireless', section, 'hostapd_bss_options'));
+	if (cur.indexOf(opt) >= 0)
+		return;
+	var list = cur.filter(function(o) { return o.split('=')[0] != opt.split('=')[0]; });
 	list.push(opt);
 	uci.set('wireless', section, 'hostapd_bss_options', list);
 }
@@ -380,72 +389,88 @@ return view.extend({
 		if (bh) {
 			bhSection = bh.section;
 			if (bhSsid)
-				uci.set('wireless', bhSection, 'ssid', bhSsid);
+				setIf('wireless', bhSection, 'ssid', bhSsid);
 			bhSsid = bhSsid || bh.ssid;
 			bhKey = uci.get('wireless', bhSection, 'key');
 			if (!bhKey) {
 				bhKey = randomKey();
-				uci.set('wireless', bhSection, 'key', bhKey);
+				setIf('wireless', bhSection, 'key', bhKey);
 			}
 		} else {
 			bhSsid = bhSsid || (fronthauls[0].ssid.replace(/-5G$/i, '') + '-BH');
 			bhKey = randomKey();
 			bhSection = uci.add('wireless', 'wifi-iface', 'mesh_bh_' + bhBand);
-			uci.set('wireless', bhSection, 'device', radioOf[bhBand]);
-			uci.set('wireless', bhSection, 'mode', 'ap');
-			uci.set('wireless', bhSection, 'network', fronthauls[0].s.network || 'lan');
-			uci.set('wireless', bhSection, 'ssid', bhSsid);
-			uci.set('wireless', bhSection, 'key', bhKey);
+			setIf('wireless', bhSection, 'device', radioOf[bhBand]);
+			setIf('wireless', bhSection, 'mode', 'ap');
+			setIf('wireless', bhSection, 'network', fronthauls[0].s.network || 'lan');
+			setIf('wireless', bhSection, 'ssid', bhSsid);
+			setIf('wireless', bhSection, 'key', bhKey);
 		}
 		/* WPA2: extenders like the RE500X don't join a WPA3 backhaul. */
-		uci.set('wireless', bhSection, 'encryption', 'psk2+ccmp');
-		uci.set('wireless', bhSection, 'hidden', '1');
-		uci.set('wireless', bhSection, 'multi_ap', '1');
-		uci.set('wireless', bhSection, 'wds', '1');
-		uci.unset('wireless', bhSection, 'disabled');
+		setIf('wireless', bhSection, 'encryption', 'psk2+ccmp');
+		setIf('wireless', bhSection, 'hidden', '1');
+		setIf('wireless', bhSection, 'multi_ap', '1');
+		setIf('wireless', bhSection, 'wds', '1');
+		if (uci.get('wireless', bhSection, 'disabled') != null)
+			uci.unset('wireless', bhSection, 'disabled');
 		addBssOption(bhSection, 'notify_mgmt_frames=1');
 
 		/* Mesh networks: 11k/v, management frames; on the backhaul band they
 		 * also onboard extenders (Multi-AP fronthaul+backhaul with WPS). */
 		fronthauls.forEach(function(w) {
-			uci.set('wireless', w.section, 'ieee80211k', '1');
-			uci.set('wireless', w.section, 'bss_transition', '1');
+			setIf('wireless', w.section, 'ieee80211k', '1');
+			setIf('wireless', w.section, 'bss_transition', '1');
 			addBssOption(w.section, 'notify_mgmt_frames=1');
 			if (w.band == bhBand) {
-				uci.set('wireless', w.section, 'multi_ap', '2');
-				uci.set('wireless', w.section, 'wps_pushbutton', '1');
-				uci.set('wireless', w.section, 'multi_ap_backhaul_ssid', bhSsid);
-				uci.set('wireless', w.section, 'multi_ap_backhaul_key', bhKey);
+				setIf('wireless', w.section, 'multi_ap', '2');
+				setIf('wireless', w.section, 'wps_pushbutton', '1');
+				setIf('wireless', w.section, 'multi_ap_backhaul_ssid', bhSsid);
+				setIf('wireless', w.section, 'multi_ap_backhaul_key', bhKey);
 				addBssOption(w.section, 'multi_ap_profile=2');
 			}
 		});
 
-		/* EasyMesh network profiles */
-		uci.sections('prplmesh', 'bss_profile', function(p) { uci.remove('prplmesh', p['.name']); });
-		var seen = {};
+		/* EasyMesh network profiles: update the existing ones in place (same
+		 * network, band and role), add the missing ones, drop the others. */
+		var wanted = [];
 		fronthauls.forEach(function(w) {
-			var key = w.ssid + '|' + w.band;
-			if (seen[key])
-				return;
-			seen[key] = true;
-			var p = uci.add('prplmesh', 'bss_profile');
-			uci.set('prplmesh', p, 'ssid', w.ssid);
-			uci.set('prplmesh', p, 'encryption', w.encryption.replace(/\+.*$/, ''));
-			var k = uci.get('wireless', w.section, 'key');
-			if (k)
-				uci.set('prplmesh', p, 'key', k);
-			uci.set('prplmesh', p, 'bands', w.band);
-			uci.set('prplmesh', p, 'fronthaul', '1');
-			uci.set('prplmesh', p, 'backhaul', '0');
+			if (!wanted.some(function(x) { return x.ssid == w.ssid && x.band == w.band && x.fronthaul; }))
+				wanted.push({ ssid: w.ssid, band: w.band, fronthaul: true,
+					encryption: w.encryption.replace(/\+.*$/, ''),
+					key: uci.get('wireless', w.section, 'key') });
 		});
-		var bp = uci.add('prplmesh', 'bss_profile');
-		uci.set('prplmesh', bp, 'ssid', bhSsid);
-		uci.set('prplmesh', bp, 'encryption', 'psk2');
-		uci.set('prplmesh', bp, 'key', bhKey);
-		uci.set('prplmesh', bp, 'bands', bhBand);
-		uci.set('prplmesh', bp, 'fronthaul', '0');
-		uci.set('prplmesh', bp, 'backhaul', '1');
-		uci.set('prplmesh', 'config', 'use_explicit_bss_profiles', '1');
+		wanted.push({ ssid: bhSsid, band: bhBand, fronthaul: false, encryption: 'psk2', key: bhKey });
+
+		var used = {};
+		wanted.forEach(function(x) {
+			var sid = null;
+			uci.sections('prplmesh', 'bss_profile', function(p) {
+				var role = (p.fronthaul != '0') == x.fronthaul && (p.backhaul == '1') == !x.fronthaul;
+				var bands = String(p.bands || '').split(/\s+/);
+				if (!sid && !used[p['.name']] && role &&
+				    (p.ssid == x.ssid || (!x.fronthaul && bands.indexOf(x.band) >= 0)) &&
+				    bands.indexOf(x.band) >= 0)
+					sid = p['.name'];
+			});
+			if (!sid) {
+				var name = (x.fronthaul ? 'fh' : 'bh') + x.band.replace(/g$/, '');
+				sid = uci.add('prplmesh', 'bss_profile', uci.get('prplmesh', name) ? null : name);
+			}
+			used[sid] = true;
+			var set = function(o, v) { setIf('prplmesh', sid, o, v); };
+			set('ssid', x.ssid);
+			set('encryption', x.encryption);
+			if (x.key)
+				set('key', x.key);
+			set('bands', x.band);
+			set('fronthaul', x.fronthaul ? '1' : '0');
+			set('backhaul', x.fronthaul ? '0' : '1');
+		});
+		uci.sections('prplmesh', 'bss_profile', function(p) {
+			if (!used[p['.name']])
+				uci.remove('prplmesh', p['.name']);
+		});
+		setIf('prplmesh', 'config', 'use_explicit_bss_profiles', '1');
 
 		/* prplMesh radios: one per radio with a mesh network */
 		var mandatory = [];
@@ -458,21 +483,21 @@ return view.extend({
 		Object.keys(byRadio).forEach(function(dev) {
 			var list = byRadio[dev], main = list[0];
 			var sid = uci.get('prplmesh', dev) ? dev : uci.add('prplmesh', 'wifi-device', dev);
-			uci.set('prplmesh', sid, 'wireless_device', dev);
-			uci.set('prplmesh', sid, 'wireless_section', main.section);
+			setIf('prplmesh', sid, 'wireless_device', dev);
+			setIf('prplmesh', sid, 'wireless_section', main.section);
 			if (main.ifname) {
-				uci.set('prplmesh', sid, 'hostap_iface', main.ifname);
-				uci.set('prplmesh', sid, 'hostap_iface_steer_vaps',
+				setIf('prplmesh', sid, 'hostap_iface', main.ifname);
+				setIf('prplmesh', sid, 'hostap_iface_steer_vaps',
 					list.map(function(w) { return w.ifname; }).filter(function(i) { return i; }).join(','));
 				mandatory.push(main.ifname);
 			}
 		});
 		if (mandatory.length)
-			uci.set('prplmesh', 'config', 'mandatory_interfaces', mandatory.join(','));
+			setIf('prplmesh', 'config', 'mandatory_interfaces', mandatory.sort().join(','));
 
-		uci.set('prplmesh', 'config', 'enabled', '1');
+		setIf('prplmesh', 'config', 'enabled', '1');
 		if (!uci.get('prplmesh', 'config', 'management_mode'))
-			uci.set('prplmesh', 'config', 'management_mode', 'Multi-AP-Controller-and-Agent');
+			setIf('prplmesh', 'config', 'management_mode', 'Multi-AP-Controller-and-Agent');
 	},
 
 	/* ---- WPS ----------------------------------------------------------- */
