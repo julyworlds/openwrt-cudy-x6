@@ -471,11 +471,9 @@ static void rteth_839x_hw_en_rxtx(struct rteth_ctrl *ctrl)
 	/* Restart TX/RX to CPU port, enable CRC checking */
 	regmap_update_bits(ctrl->map, ctrl->cfg->mac_l2_port_ctrl, 0x3 | BIT(3), 0x3 | BIT(3));
 
-	/* CPU port joins Lookup Miss Flooding Portmask */
-	/* TODO: The code below should also work for the RTL838x */
-	regmap_write(ctrl->map, RTETH_839X_TBL_ACCESS_L2_CTRL, 0x28000);
-	regmap_update_bits(ctrl->map, RTETH_839X_TBL_ACCESS_L2_DATA(0), BIT(31), BIT(31));
-	regmap_write(ctrl->map, RTETH_839X_TBL_ACCESS_L2_CTRL, 0x38000);
+	/* Do not write multicast portmask entry 0 here. That entry is an
+	 * MDB group, not the unknown-unicast flood mask, and DSA owns it.
+	 */
 
 	/* Force CPU port link up */
 	regmap_update_bits(ctrl->map, ctrl->cfg->mac_force_mode_ctrl, 0x3, 0x3);
@@ -489,7 +487,10 @@ static void rteth_930x_hw_en_rxtx(struct rteth_ctrl *ctrl)
 	/* Restart TX/RX to CPU port, enable CRC checking */
 	regmap_set_bits(ctrl->map, ctrl->cfg->mac_l2_port_ctrl, 0x3 | BIT(4));
 
-	regmap_set_bits(ctrl->map, RTETH_930X_L2_UNKN_UC_FLD_PMSK, BIT(ctrl->cfg->cpu_port));
+	/* Do not join the CPU to L2_UNKN_UC_FLD_PMSK. DSA programs that
+	 * mask to front-panel ports only so FDB-miss unicast is not DMA'd
+	 * to the MIPS core; broadcast flood still includes the CPU.
+	 */
 	regmap_write(ctrl->map, ctrl->cfg->mac_force_mode_ctrl, 0x217);
 
 	/*
@@ -508,7 +509,10 @@ static void rteth_931x_hw_en_rxtx(struct rteth_ctrl *ctrl)
 	/* Restart TX/RX to CPU port, enable CRC checking */
 	regmap_set_bits(ctrl->map, ctrl->cfg->mac_l2_port_ctrl, 0x3 | BIT(4));
 
-	regmap_set_bits(ctrl->map, RTETH_931X_L2_UNKN_UC_FLD_PMSK, BIT(ctrl->cfg->cpu_port));
+	/* Do not join the CPU to L2_UNKN_UC_FLD_PMSK. DSA programs that
+	 * mask to front-panel ports only so FDB-miss unicast is not DMA'd
+	 * to the MIPS core; broadcast flood still includes the CPU.
+	 */
 	regmap_write(ctrl->map, ctrl->cfg->mac_force_mode_ctrl, 0x2a1d);
 }
 
@@ -765,8 +769,12 @@ static void rteth_838x_hw_stop(struct rteth_ctrl *ctrl)
 	/* Disable FAST_AGE_OUT otherwise flush will hang */
 	regmap_clear_bits(ctrl->map, RTETH_838X_L2_CTRL_1, BIT(23));
 
-	/* Flush L2 address cache */
-	for (int i = 0; i <= ctrl->cfg->cpu_port; i++) {
+	/* Flush learned rows on the user ports. The CPU port holds the
+	 * static host FDB rows from assisted learning, and learning is off
+	 * there, so it has no dynamic rows to age out. Flushing it deletes
+	 * those rows. ENTRY_TYPE stays 0, as this path has always written.
+	 */
+	for (int i = 0; i < ctrl->cfg->cpu_port; i++) {
 		regmap_write(ctrl->map, ctrl->cfg->l2_tbl_flush_ctrl, BIT(26) | BIT(23) | i << 5);
 		regmap_read_poll_timeout(ctrl->map, ctrl->cfg->l2_tbl_flush_ctrl,
 					 val, !(val & BIT(26)), 100, 100000);

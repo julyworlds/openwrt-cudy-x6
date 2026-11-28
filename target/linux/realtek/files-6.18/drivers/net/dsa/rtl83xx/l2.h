@@ -8,6 +8,18 @@
 struct otto_dsa_priv;
 struct otto_l2_entry;
 
+/* Hardware encodings for L2 action fields. 83xx fields are 2 bits, so only
+ * the values 0-3 are valid there. 93xx fields are 3 bits.
+ */
+enum otto_l2_action {
+	OTTO_L2_ACTION_FORWARD = 0,
+	OTTO_L2_ACTION_DROP = 1,
+	OTTO_L2_ACTION_TRAP2CPU = 2,
+	OTTO_L2_ACTION_COPY2CPU = 3,
+	OTTO_L2_ACTION_TRAP2MASTER = 4,
+	OTTO_L2_ACTION_COPY2MASTER = 5,
+};
+
 #define RTL838X_PORT_ISO_CTRL(port)		(0x4100 + ((port) << 2))
 
 #define RTL838X_L2_CTRL_1			(0x3204)
@@ -39,7 +51,11 @@ struct otto_l2_entry;
 #define RTL838X_MC_PMASK_ALL_PORTS (GENMASK(RTL838X_CPU_PORT, 0))
 #define RTL930X_MC_PMASK_ALL_PORTS (GENMASK(RTL930X_CPU_PORT, 0))
 #define RTL931X_MC_PMASK_ALL_PORTS (GENMASK_ULL(RTL931X_CPU_PORT, 0))
-#define MC_PMASK_ALL_PORTS_IDX	((MAX_MC_PMASKS - 1))
+/* Direct bitmasks for 93xx L2_UNKN_UC_FLD registers (not MC table indices). */
+#define RTL930X_MC_PMASK_FRONT_PORTS (GENMASK(RTL930X_CPU_PORT - 1, 0))
+#define RTL931X_MC_PMASK_FRONT_PORTS (GENMASK_ULL(RTL931X_CPU_PORT - 1, 0))
+#define MC_PMASK_ALL_PORTS_IDX		(MAX_MC_PMASKS - 1)
+#define MC_PMASK_FRONT_PORTS_IDX	(MAX_MC_PMASKS - 2)
 
 /* Returns the L2 ageing time in seconds. */
 int otto_l2_get_ageing_time(struct otto_dsa_priv *priv);
@@ -61,6 +77,7 @@ void otto_l2_838x_write_mcast_pmask(int idx, u64 portmask);
 void otto_l2_838x_learning_setup(struct otto_dsa_priv *priv);
 void otto_l2_838x_enable_learning(struct otto_dsa_priv *priv, int port, bool enable);
 void otto_l2_838x_set_port_new_sa_trap(struct otto_dsa_priv *priv, int port, bool trap);
+void otto_l2_838x_set_uc_lm_act(struct otto_dsa_priv *priv, int port, u32 action);
 void otto_l2_838x_enable_flood(struct otto_dsa_priv *priv, int port, bool enable);
 void otto_l2_838x_enable_mcast_flood(struct otto_dsa_priv *priv, int port, bool enable);
 void otto_l2_838x_enable_bcast_flood(struct otto_dsa_priv *priv, int port, bool enable);
@@ -81,6 +98,7 @@ void otto_l2_839x_write_mcast_pmask(int idx, u64 portmask);
 void otto_l2_839x_learning_setup(struct otto_dsa_priv *priv);
 void otto_l2_839x_enable_learning(struct otto_dsa_priv *priv, int port, bool enable);
 void otto_l2_839x_set_port_new_sa_trap(struct otto_dsa_priv *priv, int port, bool trap);
+void otto_l2_839x_set_uc_lm_act(struct otto_dsa_priv *priv, int port, u32 action);
 void otto_l2_839x_enable_flood(struct otto_dsa_priv *priv, int port, bool enable);
 void otto_l2_839x_enable_mcast_flood(struct otto_dsa_priv *priv, int port, bool enable);
 void otto_l2_839x_enable_bcast_flood(struct otto_dsa_priv *priv, int port, bool enable);
@@ -92,6 +110,7 @@ int otto_l2_930x_port_new_salrn(int p);
 void otto_l2_930x_learning_setup(struct otto_dsa_priv *priv);
 void otto_l2_930x_enable_learning(struct otto_dsa_priv *priv, int port, bool enable);
 void otto_l2_930x_set_port_new_sa_trap(struct otto_dsa_priv *priv, int port, bool trap);
+void otto_l2_930x_set_uc_lm_act(struct otto_dsa_priv *priv, int port, u32 action);
 void otto_l2_930x_enable_flood(struct otto_dsa_priv *priv, int port, bool enable);
 void otto_l2_930x_enable_bcast_flood(struct otto_dsa_priv *priv, int port, bool enable);
 u64 otto_l2_930x_hash_seed(u64 mac, u32 vid);
@@ -116,6 +135,7 @@ void otto_l2_931x_write_entry_using_hash(struct otto_dsa_priv *priv,
 void otto_l2_931x_learning_setup(struct otto_dsa_priv *priv);
 void otto_l2_931x_enable_learning(struct otto_dsa_priv *priv, int port, bool enable);
 void otto_l2_931x_set_port_new_sa_trap(struct otto_dsa_priv *priv, int port, bool trap);
+void otto_l2_931x_set_uc_lm_act(struct otto_dsa_priv *priv, int port, u32 action);
 void otto_l2_931x_enable_flood(struct otto_dsa_priv *priv, int port, bool enable);
 void otto_l2_931x_enable_bcast_flood(struct otto_dsa_priv *priv, int port, bool enable);
 u64 otto_l2_931x_read_mcast_pmask(int idx);
