@@ -110,6 +110,11 @@ return view.extend({
 		o.datatype = 'range(0,100)';
 		o.placeholder = '10';
 
+		o = s.taboption('steering', form.Flag, 'legacy_client_steering', _('Move clients without 802.11v by disconnecting them'),
+			_('Clients that support 802.11v are asked to move and never disconnected. Those known not to support it are left alone; enable this to block them on their access point and disconnect them instead, so they reconnect to the better one (a short interruption).'));
+		o.default = '0';
+		o.rmempty = false;
+
 		o = s.taboption('steering', form.Flag, 'agent_steering', _('Let other agents steer their clients'),
 			_('For EasyMesh agents that are not prplMesh (for example a TP-Link extender). Disabled: the controller decides for their clients too, measuring them from this router. Enabled: the agent may move a client whose signal drops below the threshold below, to an access point it picks itself without measuring the others.'));
 		o.enabled = '2';
